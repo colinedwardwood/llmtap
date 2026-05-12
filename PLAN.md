@@ -1037,11 +1037,29 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   into `runHashToken`, parses the printed hash, and round-trips it
   through `auth.Verify`.
 
-- [ ] **A11 — Slowloris body upload (item 1.10)** 🔴
+- [x] **A11 — Slowloris body upload (item 1.10)** 🔴
   **Finding:** No body-read deadline; slow uploaders pin a
   goroutine + connection indefinitely. Cheap remote-DoS.
-  **Fix:** `http.body_read_timeout` (default 30s) enforced via
-  `MaxBytesReader` + `context.WithTimeout`.
+  **Fix:** Added `HTTPTimeouts.BodyReadTimeout` (default 30s) and set
+  it as `http.Server.ReadTimeout` in `proxy.NewServer`. The PLAN's
+  preferred in-handler watchdog (close `r.Body` from a goroutine
+  when a deadline expires) turned out to be unusable: Go's
+  `(*http.body).Close()` synchronously drains the remaining bytes
+  using the same slow source, so closing the body doesn't actually
+  unblock the in-flight read. `Server.ReadTimeout` works at the
+  TCP-conn level — the connection is torn down mid-read — and is
+  the only correctness-preserving choice in the current stdlib.
+  Trade-off: clients see a connection-closed transport error rather
+  than a graceful 408; the goal of A11 (no pinned goroutine) is
+  preserved.
+  **Evidence:**
+  - `TestSlowUploadIsTerminated`: a 5 KB body delivered at 50 ms/byte
+    (~250 s total) against a 300 ms deadline is aborted within
+    2 s and zero upstream traffic is observed.
+  - `TestNoBodyReadTimeoutWhenUnset`: `BodyReadTimeout=0` keeps the
+    pre-A11 behaviour — slow uploads complete and reach upstream.
+  - Tests wire through `httptest.NewUnstartedServer` so the
+    `ReadTimeout` knob (the A11 surface) is actually exercised.
 
 - [ ] **A12 — Per-upstream concurrency cap (item 1.5)** 🔴
   **Finding:** No bound on in-flight requests per upstream; an

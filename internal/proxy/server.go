@@ -36,10 +36,14 @@ func NewServer(cfg config.Config, h *Handler, logger *slog.Logger) (*Server, err
 		Addr:              cfg.Listen,
 		Handler:           h.WrapWithOTel("llmtap"),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
-		IdleTimeout:       cfg.HTTP.IdleTimeout,
-		// WriteTimeout intentionally zero: streaming responses must not be
-		// killed by a server-side deadline. Per-request timeouts belong on
-		// the client.
+		// ReadTimeout bounds the inbound request, headers + body. Slow
+		// uploaders trying to pin a goroutine for the full body
+		// duration trip it. WriteTimeout stays zero so streaming
+		// responses (which can legitimately run for minutes) aren't
+		// killed by a server-side deadline; per-stream timeouts belong
+		// on the client.
+		ReadTimeout: cfg.HTTP.BodyReadTimeout,
+		IdleTimeout: cfg.HTTP.IdleTimeout,
 	}
 
 	if cfg.TLS.Enabled() {

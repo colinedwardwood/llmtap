@@ -143,6 +143,11 @@ type HTTPTimeouts struct {
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
+	// BodyReadTimeout bounds how long the proxy waits for the inbound
+	// request body to arrive. Zero or negative disables the deadline
+	// (pre-A11 behaviour). Default 30 s tolerates legitimately large
+	// multimodal uploads while killing slowloris-style holds.
+	BodyReadTimeout time.Duration `yaml:"body_read_timeout"`
 }
 
 // Service identifies llmtap to the OTel backend (resource attributes).
@@ -189,6 +194,7 @@ func Default() Config {
 			ReadHeaderTimeout: 30 * time.Second,
 			IdleTimeout:       120 * time.Second,
 			ShutdownTimeout:   30 * time.Second,
+			BodyReadTimeout:   30 * time.Second,
 		},
 		Service: Service{
 			Name:      "llmtap",

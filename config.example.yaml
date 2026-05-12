@@ -65,6 +65,12 @@ http:
   read_header_timeout: 30s
   idle_timeout: 120s
   shutdown_timeout: 30s
+  # body_read_timeout bounds the inbound request read (headers + body).
+  # A slow uploader trying to pin a goroutine for the full body
+  # duration trips it. Zero disables the deadline (do not do this in
+  # production). Outbound response writes stay unbounded so streaming
+  # LLM responses can legitimately run for minutes.
+  body_read_timeout: 30s
 
 # Inbound request shaping. llmtap buffers up to 1 MiB of every request
 # body for parser-driven enrichment, then forwards the original stream
