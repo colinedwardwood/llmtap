@@ -1118,7 +1118,7 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   empty `LLMTAP_TLS_CERT_FILE` — matches the documented escape-hatch
   semantics.
 
-- [x] **A15 — No CI / unsigned releases (item 3.1)** 🔴
+- [x] **A15 — No CI / unsigned releases (item 3.1)** 🔴 *(verified green on origin)*
   **Finding:** Every protection in this plan is on the honor system
   without enforced CI. README invites users to download unsigned
   binaries handling production credentials.
@@ -1163,7 +1163,7 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 - [ ] **A22 — Strict operation-path matching (item 1.12)** 🟡
 - [ ] **A23 — Hot certificate reload (item 2.1)** 🟡
 - [ ] **A24 — Circuit breaker per upstream (item 2.2)** 🟡
-- [ ] **A25 — OTel module version alignment (item 2.4)** 🟡
+- [x] **A25 — OTel module version alignment (item 2.4)** 🟡 *(closed incidentally via A15 dep bumps to v1.43.0)*
 - [ ] **A26 — Tool-call streaming coverage (item 2.5)** 🟡
 - [ ] **A27 — Transport tuning per upstream (item 2.6)** 🟡
 - [ ] **A28 — Stream non-streaming JSON through (item 2.7)** 🟡
