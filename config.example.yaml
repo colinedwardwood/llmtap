@@ -43,6 +43,11 @@ telemetry:
   endpoint: localhost:4317
   protocol: grpc
   insecure: true
+  # acknowledge_insecure: true   # required when insecure=true AND endpoint
+                                 # is not loopback / RFC1918. Exporting
+                                 # prompts in cleartext over the WAN is
+                                 # rarely intentional, so the proxy
+                                 # refuses by default.
   sample_ratio: 1.0
   timeout: 10s
   # headers:

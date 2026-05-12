@@ -29,6 +29,8 @@ upstreams:
 telemetry:
   endpoint: tempo:4317
   protocol: grpc
+  insecure: true
+  acknowledge_insecure: true   # tempo:4317 isn't loopback / RFC1918
   sample_ratio: 0.5
 content:
   mode: events
@@ -55,6 +57,7 @@ content:
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("LLMTAP_LISTEN", "127.0.0.1:12345")
 	t.Setenv("LLMTAP_OTLP_ENDPOINT", "tempo.svc:4317")
+	t.Setenv("LLMTAP_OTLP_INSECURE", "false") // tempo.svc isn't local; keep TLS at collector
 	t.Setenv("LLMTAP_CAPTURE", "events")
 
 	cfg, err := Load("")
@@ -138,6 +141,63 @@ func TestTLSPartialIsRejected(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestValidateRejectsInsecureWAN(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.Telemetry.Endpoint = "otel.example.com:4317"
+	cfg.Telemetry.Insecure = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("insecure OTLP to a non-local endpoint must be rejected")
+	}
+}
+
+func TestValidateAcknowledgeInsecureBypassesGuard(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.Telemetry.Endpoint = "otel.example.com:4317"
+	cfg.Telemetry.Insecure = true
+	cfg.Telemetry.AcknowledgeInsecure = true
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("acknowledge_insecure=true must allow plaintext OTLP off-host: %v", err)
+	}
+}
+
+func TestValidateInsecureLocalEndpoints(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		"localhost:4317",
+		"127.0.0.1:4317",
+		"[::1]:4317",
+		"10.0.0.5:4317",
+		"172.16.5.5:4317",
+		"192.168.1.5:4317",
+		"https://localhost:4318",
+		"http://127.0.0.1:4318",
+	}
+	for _, ep := range cases {
+		cfg := Default()
+		cfg.Telemetry.Endpoint = ep
+		cfg.Telemetry.Insecure = true
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("endpoint %q + insecure should be allowed: %v", ep, err)
+		}
+	}
+}
+
+func TestValidateSecureWANOK(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.Telemetry.Endpoint = "otel.example.com:4317"
+	cfg.Telemetry.Insecure = false
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("secure OTLP to a WAN endpoint must be allowed: %v", err)
 	}
 }
 

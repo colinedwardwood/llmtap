@@ -980,12 +980,31 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   - `TestNewLoggerAttachesServiceAttrs` — `service.name` and
     `service.version` present on every record.
 
-- [ ] **A9 — Insecure OTLP + WAN endpoint silently leaks (item 1.7)** 🔴
+- [x] **A9 — Insecure OTLP + WAN endpoint silently leaks (item 1.7)** 🔴
   **Finding:** `Default.Telemetry.Insecure: true` paired with an
   edited-only `Endpoint` ships every trace (incl. captured content)
   in cleartext over the WAN. No validation guardrail.
-  **Fix:** Refuse startup when `insecure=true` + non-local endpoint,
-  unless `acknowledge_insecure: true`.
+  **Fix:** Added `Telemetry.AcknowledgeInsecure` config field +
+  `isLocalEndpoint` helper that recognizes loopback IPs, `localhost`,
+  and RFC1918 / RFC4193 private space (`net.IP.IsLoopback()` and
+  `net.IP.IsPrivate()`). `Config.Validate` now refuses startup when
+  `telemetry.insecure=true` and the endpoint is non-local, unless
+  `acknowledge_insecure=true` is set explicitly. The error message
+  mirrors the existing `listen`-side guardrail in style.
+  **Evidence:**
+  - `TestValidateRejectsInsecureWAN`: `endpoint: otel.example.com:4317`
+    + `insecure: true` returns an error.
+  - `TestValidateAcknowledgeInsecureBypassesGuard`: same config plus
+    `acknowledge_insecure: true` is accepted.
+  - `TestValidateInsecureLocalEndpoints`: loopback (`127.0.0.1`,
+    `[::1]`, `localhost`) and RFC1918 (`10.0.0.5`, `172.16.5.5`,
+    `192.168.1.5`) endpoints pass without acknowledgement. Scheme
+    prefixes (`http://`, `https://`) handled.
+  - `TestValidateSecureWANOK`: WAN endpoint with `insecure: false`
+    passes — guard is scoped to the cleartext combination.
+  - Existing `TestLoadYAMLOverrides` / `TestEnvOverrides` updated to
+    use legitimate values (`acknowledge_insecure: true` or
+    `insecure: false`) against their non-local endpoints.
 
 - [ ] **A10 — No client authentication (item 1.13)** 🔴
   **Finding:** llmtap forwards `Authorization: Bearer sk-…` verbatim

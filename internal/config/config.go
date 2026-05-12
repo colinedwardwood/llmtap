@@ -89,6 +89,11 @@ type Telemetry struct {
 	Headers     Headers       `yaml:"headers"`
 	SampleRatio float64       `yaml:"sample_ratio"`
 	Timeout     time.Duration `yaml:"timeout"`
+	// AcknowledgeInsecure explicitly opts the operator into plaintext
+	// OTLP to a non-loopback / non-RFC1918 endpoint. The default refuses
+	// that combination — exporting prompts and trace metadata over the
+	// WAN in cleartext is rarely intentional.
+	AcknowledgeInsecure bool `yaml:"acknowledge_insecure"`
 }
 
 // Headers is a typed map so YAML round-trips and we never reach for `any`.
@@ -302,6 +307,12 @@ func (c *Config) Validate() error {
 	if c.Telemetry.SampleRatio < 0 || c.Telemetry.SampleRatio > 1 {
 		errs = append(errs, fmt.Errorf("telemetry.sample_ratio %v: must be in [0,1]", c.Telemetry.SampleRatio))
 	}
+	if c.Telemetry.Insecure && !c.Telemetry.AcknowledgeInsecure && !isLocalEndpoint(c.Telemetry.Endpoint) {
+		errs = append(errs, fmt.Errorf(
+			"telemetry.endpoint %q is non-local but telemetry.insecure=true: configure TLS at the collector and set telemetry.insecure=false, or set telemetry.acknowledge_insecure=true to acknowledge plaintext OTLP off-host",
+			c.Telemetry.Endpoint,
+		))
+	}
 
 	switch c.Content.Mode {
 	case CaptureOff, CaptureEvents, CaptureLogs, "":
@@ -313,6 +324,35 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// isLocalEndpoint reports whether the OTLP endpoint resolves to a
+// host that is process-local, loopback, or in RFC1918 / RFC4193
+// private space. Plaintext OTLP to such hosts is operationally
+// reasonable; plaintext to anywhere else is a foot-gun.
+//
+// Hostnames other than "localhost" are conservatively treated as
+// non-local — we don't want to resolve DNS at config-validate time.
+func isLocalEndpoint(endpoint string) bool {
+	s := endpoint
+	if idx := strings.Index(s, "://"); idx >= 0 {
+		s = s[idx+3:]
+	}
+	host, _, err := net.SplitHostPort(s)
+	if err != nil {
+		host = s
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
 }
 
 // isLoopbackAddr reports whether the configured listen address binds to a
