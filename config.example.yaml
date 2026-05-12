@@ -61,6 +61,14 @@ http:
   idle_timeout: 120s
   shutdown_timeout: 30s
 
+# Inbound request shaping. llmtap buffers up to 1 MiB of every request
+# body for parser-driven enrichment, then forwards the original stream
+# byte-for-byte. Bodies above max_body_bytes are refused with HTTP 413
+# without contacting the upstream. Default is 32 MiB to accommodate
+# multimodal (vision / audio) payloads.
+request:
+  max_body_bytes: 33554432   # 32 MiB
+
 service:
   name: llmtap
   namespace: observability

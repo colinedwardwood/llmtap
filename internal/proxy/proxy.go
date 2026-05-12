@@ -35,11 +35,13 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// maxRequestBodyBytes caps the request body llmtap reads into memory before
-// forwarding. Real LLM requests rarely exceed ~512 KiB; bodies above the cap
-// are forwarded transparently without enrichment to avoid OOM in adversarial
-// settings. Configurable in a future revision if needed.
-const maxRequestBodyBytes = 4 * 1024 * 1024 // 4 MiB
+// maxEnrichmentBodyBytes caps how much of an inbound request body llmtap
+// buffers into memory for parser-driven enrichment. Real LLM requests
+// rarely exceed ~512 KiB; the few that do (vision, audio, agent traces)
+// are forwarded byte-for-byte but the request span only gets the
+// metadata that the head bytes happen to surface. The proxy is allowed
+// to give up on enrichment; it is not allowed to give up on the bytes.
+const maxEnrichmentBodyBytes = 1024 * 1024 // 1 MiB
 
 // ctxKey scopes per-request data carried into ModifyResponse. We never share
 // a *httputil.ReverseProxy field across goroutines for per-request state.
@@ -165,16 +167,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.inflight.Add(r.Context(), 1, metric.WithAttributes(attribute.String("upstream", upstream.Name)))
 	defer h.inflight.Add(r.Context(), -1, metric.WithAttributes(attribute.String("upstream", upstream.Name)))
 
-	body, err := readCappedBody(r)
+	// Hard-cap pre-check: if the caller advertises a body above the
+	// configured ceiling, refuse before we drain any bytes.
+	if hardCap := h.cfg.Request.MaxBodyBytes; hardCap > 0 && r.ContentLength > hardCap {
+		http.Error(w, "request body exceeds maximum", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	body, err := captureHeadAndForward(r, h.cfg.Request.MaxBodyBytes)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			http.Error(w, "request body exceeds maximum", http.StatusRequestEntityTooLarge)
+			return
+		}
 		h.logger.WarnContext(r.Context(), "request body read failed; falling back to transparent proxy",
 			slog.Any("err", err),
 		)
 		rp.ServeHTTP(w, r)
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
 
 	ctx, span := h.tracer.Start(r.Context(),
 		genai.SpanName(op, ""),
@@ -340,19 +351,79 @@ func (h *Handler) responseInterceptor(
 	return finalize, modify
 }
 
-// readCappedBody reads at most maxRequestBodyBytes+1 to detect overflow and
-// restores the original body for the proxy to forward.
-func readCappedBody(r *http.Request) ([]byte, error) {
-	limited := io.LimitReader(r.Body, maxRequestBodyBytes+1)
-	body, err := io.ReadAll(limited)
-	_ = r.Body.Close()
+// errBodyTooLarge signals that an inbound request body exceeds the
+// configured hard cap. Callers translate this to an HTTP 413.
+var errBodyTooLarge = errors.New("request body exceeds maximum")
+
+// captureHeadAndForward buffers up to maxEnrichmentBodyBytes of r.Body
+// for parser-driven enrichment, then reconstitutes r.Body so the proxy
+// can forward the original byte stream unchanged — even if it exceeds
+// the enrichment buffer.
+//
+// hardCap (0 = unlimited) is enforced *while* draining the body. If the
+// stream surpasses hardCap, errBodyTooLarge is returned and the caller
+// is expected to respond 413 without forwarding.
+func captureHeadAndForward(r *http.Request, hardCap int64) ([]byte, error) {
+	// Read enough to (a) populate the enrichment slice and (b) detect
+	// that the body is larger than the enrichment buffer.
+	limited := io.LimitReader(r.Body, maxEnrichmentBodyBytes+1)
+	head, err := io.ReadAll(limited)
 	if err != nil {
+		_ = r.Body.Close()
 		return nil, err
 	}
-	if int64(len(body)) > maxRequestBodyBytes {
-		return nil, errors.New("request body exceeds maximum")
+
+	if int64(len(head)) <= maxEnrichmentBodyBytes {
+		// Whole body fits in the enrichment buffer. Close the original
+		// reader and serve the buffered bytes to the upstream.
+		_ = r.Body.Close()
+		if hardCap > 0 && int64(len(head)) > hardCap {
+			return nil, errBodyTooLarge
+		}
+		r.Body = io.NopCloser(bytes.NewReader(head))
+		r.ContentLength = int64(len(head))
+		return head, nil
 	}
-	return body, nil
+
+	// Body exceeds enrichment buffer. We've captured maxEnrichmentBodyBytes+1
+	// bytes in `head`; the last byte is "lookahead" proving more data
+	// exists. Reassemble r.Body as [head + remainder] so the forwarded
+	// stream stays byte-for-byte identical to the inbound one. The
+	// enrichment slice returned to the caller is truncated to the
+	// enrichment cap; ParseRequest may fail to unmarshal incomplete
+	// JSON, in which case the proxy emits a request span with the
+	// metadata it managed to recover and zero else.
+	closer := r.Body
+	rest := &capCountingReader{src: r.Body, limit: hardCap, alreadyRead: int64(len(head))}
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{
+		Reader: io.MultiReader(bytes.NewReader(head), rest),
+		Closer: closer,
+	}
+	r.ContentLength = -1 // chunked: total size unknown to us
+	return head[:maxEnrichmentBodyBytes], nil
+}
+
+// capCountingReader wraps an io.Reader and aborts when the cumulative
+// byte count would exceed limit (where the initial alreadyRead counts
+// against limit). limit == 0 means no cap.
+type capCountingReader struct {
+	src         io.Reader
+	limit       int64
+	alreadyRead int64
+}
+
+func (c *capCountingReader) Read(p []byte) (int, error) {
+	n, err := c.src.Read(p)
+	if n > 0 {
+		c.alreadyRead += int64(n)
+		if c.limit > 0 && c.alreadyRead > c.limit {
+			return n, errBodyTooLarge
+		}
+	}
+	return n, err
 }
 
 func isEventStream(h http.Header) bool {

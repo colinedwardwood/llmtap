@@ -856,14 +856,32 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 
 ## High (data loss / DoS / auth boundary / cost misreporting)
 
-- [ ] **A3 — Oversize body silent 502 (item 0.1)** 🔴
+- [x] **A3 — Oversize body silent 502 (item 0.1)** 🔴
   **Finding:** Requests > 4 MiB read fully, then rejected with body
   already closed → upstream gets zero bytes, client gets 502.
   Documented as a failing test in the suite. Violates "forwards every
   request unchanged" contract.
-  **Fix:** Tee-based capture for enrichment; never block the
-  forwarded byte stream below a hard `max_body_bytes` ceiling; 413
-  above it.
+  **Fix:** Split the buffering concept in two: a fixed 1 MiB
+  *enrichment buffer* (`maxEnrichmentBodyBytes`) that the parser
+  reads from, and a configurable *hard cap* (`config.Request.MaxBodyBytes`,
+  default 32 MiB) that gates whether we forward at all. Bodies up to
+  the hard cap are forwarded byte-for-byte via an `io.MultiReader` of
+  `[captured head + remaining stream]`; the enrichment slice is
+  truncated at the buffer boundary so `ParseRequest` may degrade but
+  the request reaches the upstream intact. Bodies above the hard cap
+  are refused with HTTP 413 — either by `Content-Length` pre-check or
+  by a `capCountingReader` that aborts mid-stream once the cumulative
+  count surpasses the cap. `config.example.yaml` documents the new
+  `request:` section.
+  **Evidence:**
+  - `TestProxyOversizeBodyForwardsIntact` (renamed from
+    `TestProxyOversizeBodyIsCorrupted`): a 5 MiB chat-completions body
+    arrives at the upstream byte-identical to what the client sent.
+  - `TestProxyHardCapRejectsCleanly`: a 3 MiB body against a 2 MiB
+    hard cap returns 413 with zero upstream traffic.
+  - Full suite is now uniformly green for the first time in the
+    project's history — the previously-documented bug-marker failure
+    is gone.
 
 - [ ] **A4 — 4xx body truncated to client (item 0.2)** 🔴
   **Finding:** Error responses are replaced with a 64 KiB snippet

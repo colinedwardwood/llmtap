@@ -28,6 +28,17 @@ type Config struct {
 	Content       ContentCapture `yaml:"content"`
 	HTTP          HTTPTimeouts   `yaml:"http"`
 	Service       Service        `yaml:"service"`
+	Request       Request        `yaml:"request"`
+}
+
+// Request shapes the proxy's handling of inbound request bodies.
+type Request struct {
+	// MaxBodyBytes is the hard ceiling above which the proxy refuses an
+	// inbound request body with 413. Below this, bodies are forwarded
+	// byte-for-byte even if they exceed the enrichment buffer used to
+	// parse model / stream / token metadata. A value of 0 disables the
+	// limit, which is rarely what the operator wants.
+	MaxBodyBytes int64 `yaml:"max_body_bytes"`
 }
 
 // TLS configures listener-side TLS termination. Setting CertFile and KeyFile
@@ -135,6 +146,11 @@ func Default() Config {
 			Name:      "llmtap",
 			Namespace: "observability",
 			Env:       "dev",
+		},
+		Request: Request{
+			// 32 MiB headroom for multimodal payloads (vision, audio).
+			// Above this, llmtap returns 413 without contacting upstream.
+			MaxBodyBytes: 32 * 1024 * 1024,
 		},
 	}
 }
