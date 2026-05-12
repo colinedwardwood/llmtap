@@ -30,6 +30,34 @@ type Config struct {
 	Service       Service        `yaml:"service"`
 	Request       Request        `yaml:"request"`
 	Pricing       Pricing        `yaml:"pricing"`
+	Auth          Auth           `yaml:"auth"`
+}
+
+// Auth controls listener-side bearer-token authentication. When Tokens
+// is non-empty, every request must present a matching token in the
+// configured Header, or the proxy responds 401 with no upstream call.
+// Stored tokens are argon2id PHC hashes — generate with
+// `llmtap hash-token`.
+type Auth struct {
+	Tokens []string `yaml:"tokens"`
+	// Header is the request header llmtap reads the bearer token from.
+	// Default `X-LLMTAP-Token` keeps the upstream `Authorization`
+	// header untouched so the LLM API key still reaches the upstream
+	// verbatim. Operators who want to combine boundaries can set this
+	// to `Authorization`, in which case the upstream API key must come
+	// from a different header (e.g. `X-Upstream-Authorization`).
+	Header string `yaml:"header"`
+}
+
+// Enabled reports whether the auth gate is active.
+func (a Auth) Enabled() bool { return len(a.Tokens) > 0 }
+
+// HeaderName returns the configured header or the documented default.
+func (a Auth) HeaderName() string {
+	if a.Header == "" {
+		return "X-LLMTAP-Token"
+	}
+	return a.Header
 }
 
 // Pricing overrides the built-in cost catalogue with operator-supplied

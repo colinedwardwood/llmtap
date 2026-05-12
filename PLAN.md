@@ -1006,11 +1006,36 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
     use legitimate values (`acknowledge_insecure: true` or
     `insecure: false`) against their non-local endpoints.
 
-- [ ] **A10 — No client authentication (item 1.13)** 🔴
+- [x] **A10 — No client authentication (item 1.13)** 🔴
   **Finding:** llmtap forwards `Authorization: Bearer sk-…` verbatim
   with no caller check. Demo compose stack ships open-relay default.
-  **Fix:** Optional bearer-token allow-list (argon2id-hashed) gating
-  every non-loopback request.
+  **Fix:** New `internal/auth` package implements argon2id PHC
+  hashing (`Hash`, `Verify`) and a `Verifier` that parses an operator
+  allow-list up-front and constant-time compares incoming bearer
+  tokens at request time. Added `config.Auth{Tokens, Header}` with
+  default header `X-LLMTAP-Token` (kept distinct from `Authorization`
+  so the upstream LLM API key isn't double-claimed). Handler stores
+  a `*auth.Verifier`; `ServeHTTP` short-circuits with 401 + zero
+  upstream traffic when a request arrives without a matching token.
+  The auth header is stripped from the inbound request before
+  forwarding, so the listener-side secret never leaks to the
+  upstream. New `llmtap hash-token` CLI reads plaintext from stdin
+  (keeps secrets out of argv / shell history) and prints the PHC
+  hash.
+  **Evidence (unit):** ten tests in `internal/auth/auth_test.go`
+  covering Hash↔Verify roundtrip, salt randomization, wrong-plaintext
+  rejection, PHC parser refusal on malformed input, Verifier
+  acceptance of any-of-N tokens, empty-token rejection, `Enabled()`
+  semantics, fail-fast at construction.
+  **Evidence (integration):** six tests in `internal/proxy/auth_test.go`
+  covering missing-token → 401, wrong-token → 401, correct-token
+  → 200 + upstream hit, bare and `Bearer …` forms both accepted,
+  tokens-empty path stays untouched, custom-header configuration.
+  Defensive assertion: upstream fake fails the test if the auth
+  header reaches it.
+  **Evidence (CLI):** `cmd/llmtap/hashtoken_test.go` pipes plaintext
+  into `runHashToken`, parses the printed hash, and round-trips it
+  through `auth.Verify`.
 
 - [ ] **A11 — Slowloris body upload (item 1.10)** 🔴
   **Finding:** No body-read deadline; slow uploaders pin a

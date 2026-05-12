@@ -74,6 +74,21 @@ http:
 request:
   max_body_bytes: 33554432   # 32 MiB
 
+# Listener-side bearer-token authentication. When `tokens` is empty
+# (the default), every reachable caller may use the proxy — which is
+# fine on a loopback bind but dangerous anywhere else, since the
+# proxy forwards `Authorization: Bearer sk-…` to the upstream LLM
+# verbatim. Generate one hash per client with `llmtap hash-token`:
+#
+#   echo -n 'client-secret-here' | ./llmtap hash-token
+#
+# The plaintext token goes in the client's env (e.g. as a custom
+# header injected by their SDK); the hash goes here.
+auth:
+  # tokens:
+  #   - "$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>"
+  header: "X-LLMTAP-Token"   # default; keeps Authorization free for the upstream
+
 # Cost catalogue override. Built-in prices ship with llmtap (see
 # internal/pricing/prices.yaml for the embedded snapshot). Production
 # deployments should point `path` at a YAML file with the same shape

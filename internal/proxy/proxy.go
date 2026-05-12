@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/colinedwardwood/llmtap/internal/auth"
 	"github.com/colinedwardwood/llmtap/internal/config"
 	"github.com/colinedwardwood/llmtap/internal/genai"
 	"github.com/colinedwardwood/llmtap/internal/labels"
@@ -79,6 +80,11 @@ type Handler struct {
 	// overlaid with an operator file). Held per-Handler so
 	// `cfg.Pricing.Path` actually changes the recorded cost.
 	pricing *pricing.Table
+
+	// auth gates inbound requests against an operator-configured
+	// allow-list of bearer-token hashes. Nil = no auth required.
+	auth       *auth.Verifier
+	authHeader string
 }
 
 // New builds a Handler from validated config and a Providers bundle. It
@@ -146,6 +152,11 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 		return nil, fmt.Errorf("pricing: %w", err)
 	}
 
+	verifier, err := auth.NewVerifier(cfg.Auth.Tokens)
+	if err != nil {
+		return nil, fmt.Errorf("auth: %w", err)
+	}
+
 	return &Handler{
 		cfg:        cfg,
 		providers:  providers,
@@ -157,10 +168,20 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 		logger:     logger,
 		modelLabel: labels.NewModelLabel(labels.DefaultMaxCardinality),
 		pricing:    priceTable,
+		auth:       verifier,
+		authHeader: cfg.Auth.HeaderName(),
 	}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.auth.Enabled() && !h.checkAuth(r) {
+		// 401 with no upstream contact. Do not echo the supplied token,
+		// even truncated — a noisy 401 helps an attacker time their
+		// guess.
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	upstream, ok := h.cfg.Match(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -498,6 +519,26 @@ func truncateUTF8(s string, n int) string {
 		n--
 	}
 	return s[:n] + "…"
+}
+
+// checkAuth pulls the bearer token out of the configured request
+// header, strips the optional "Bearer " prefix, and asks the verifier
+// to constant-time match it. Also strips the header from the inbound
+// request so it does not get forwarded to upstream (the verified
+// token is llmtap's secret, not the LLM provider's).
+func (h *Handler) checkAuth(r *http.Request) bool {
+	raw := r.Header.Get(h.authHeader)
+	r.Header.Del(h.authHeader)
+	if raw == "" {
+		return false
+	}
+	// Accept either `Bearer <token>` or a bare token, so operators
+	// can choose between matching standard reverse-proxy convention
+	// and using a custom header naked.
+	if strings.HasPrefix(raw, "Bearer ") {
+		raw = strings.TrimPrefix(raw, "Bearer ")
+	}
+	return h.auth.Verify(raw)
 }
 
 // WrapWithOTel returns the handler wrapped in otelhttp middleware so llmtap's

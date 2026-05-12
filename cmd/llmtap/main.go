@@ -20,8 +20,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/colinedwardwood/llmtap/internal/auth"
 	"github.com/colinedwardwood/llmtap/internal/buildinfo"
 	"github.com/colinedwardwood/llmtap/internal/config"
 	"github.com/colinedwardwood/llmtap/internal/provider"
@@ -47,6 +49,8 @@ func run(args []string, stderr io.Writer) error {
 	switch cmd {
 	case "up":
 		return runUp(rest, stderr)
+	case "hash-token":
+		return runHashToken(rest, os.Stdin, os.Stdout, stderr)
 	case "version", "--version", "-v":
 		_, _ = fmt.Fprintf(stderr, "llmtap %s (commit %s, built %s)\n",
 			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
@@ -65,9 +69,39 @@ func usage(w io.Writer) {
 
 Commands:
   up          run the proxy
+  hash-token  read a bearer token from stdin, print the argon2id hash
+              suitable for auth.tokens in config.yaml
   version     print version, commit, and build date
 
 Run "llmtap up --help" for the up flags.`)
+}
+
+// runHashToken reads a plaintext bearer token from stdin and writes the
+// argon2id PHC-encoded hash to stdout. Reading from stdin avoids putting
+// the secret in the shell history or argv (visible via /proc).
+func runHashToken(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("hash-token", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	raw, err := io.ReadAll(stdin)
+	if err != nil {
+		return fmt.Errorf("read stdin: %w", err)
+	}
+	plain := strings.TrimRight(string(raw), "\r\n")
+	if plain == "" {
+		return errors.New("hash-token: empty token on stdin")
+	}
+	encoded, err := auth.Hash(plain)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, encoded)
+	return nil
 }
 
 func runUp(args []string, stderr io.Writer) error {
