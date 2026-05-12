@@ -97,6 +97,12 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 				// add a marker so the upstream can identify llmtap in
 				// logs without ambiguity.
 				r.Out.Header.Set("Via", "llmtap")
+				// Strip the client's Accept-Encoding so http.Transport
+				// injects its own and transparently decompresses any
+				// gzip response. Without this, gzip-encoded JSON
+				// reaches modify() unparsed and every token / cost
+				// metric records as zero (A6).
+				r.Out.Header.Del("Accept-Encoding")
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				if fn, ok := resp.Request.Context().Value(ctxKeyModify).(modifyFn); ok && fn != nil {

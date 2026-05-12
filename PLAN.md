@@ -915,12 +915,23 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   ManualReader, and asserts its `TraceID` equals the span's `TraceID`.
   Before the fix, no exemplar carried a trace context at all.
 
-- [ ] **A6 — Gzipped responses record zero tokens (item 0.4)** 🔴
+- [x] **A6 — Gzipped responses record zero tokens (item 0.4)** 🔴
   **Finding:** When clients set `Accept-Encoding: gzip`, the JSON
   parser sees gzip bytes and fails silently. FinOps disaster —
   recorded cost = $0 for gzipped calls.
-  **Fix:** Strip `Accept-Encoding` from the forwarded request OR
-  decompress into the side buffer in `modify`.
+  **Fix:** One-line addition to the `Rewrite` hook:
+  `r.Out.Header.Del("Accept-Encoding")`. With the client's header
+  stripped, `http.Transport` injects its own and engages transparent
+  decompression. `modify` always sees plaintext JSON. The trade-off
+  (a few more bytes between llmtap and the upstream) is paid by
+  llmtap, not the client.
+  **Evidence:**
+  - `TestProxyGzippedResponseStillCountsTokens`: client sends
+    `Accept-Encoding: gzip`, upstream serves gzipped JSON, span
+    records `gen_ai.usage.input_tokens > 0` (was 0 before fix).
+  - `TestProxyStripsAcceptEncodingFromOutbound`: outbound request
+    seen by upstream does not carry the client's `Accept-Encoding`
+    verbatim.
 
 - [ ] **A7 — Pricing table cannot be overridden (item 0.5)** 🔴
   **Finding:** README claims operators can override negotiated rates;
