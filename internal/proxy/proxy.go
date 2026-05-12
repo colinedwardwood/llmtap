@@ -85,6 +85,13 @@ type Handler struct {
 	// allow-list of bearer-token hashes. Nil = no auth required.
 	auth       *auth.Verifier
 	authHeader string
+
+	// upstreamSem caps concurrent in-flight requests per upstream.
+	// A nil chan means "unlimited" (no entry for that upstream means
+	// it wasn't configured with max_in_flight). Buffered chans are
+	// the simplest counting-semaphore primitive without pulling in
+	// x/sync.
+	upstreamSem map[string]chan struct{}
 }
 
 // New builds a Handler from validated config and a Providers bundle. It
@@ -92,7 +99,11 @@ type Handler struct {
 // missing from the registry.
 func New(cfg config.Config, providers provider.Registry, prov telemetry.Providers, logger *slog.Logger) (*Handler, error) {
 	rps := make(map[string]*httputil.ReverseProxy, len(cfg.Upstreams))
+	upstreamSem := make(map[string]chan struct{}, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
+		if u.MaxInFlight > 0 {
+			upstreamSem[u.Name] = make(chan struct{}, u.MaxInFlight)
+		}
 		if _, ok := providers[u.Provider]; !ok {
 			return nil, fmt.Errorf("provider %q not registered (upstream %q)", u.Provider, u.Name)
 		}
@@ -158,18 +169,19 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 	}
 
 	return &Handler{
-		cfg:        cfg,
-		providers:  providers,
-		rps:        rps,
-		tracer:     prov.Tracer,
-		meters:     prov.Meters,
-		inflight:   infl,
-		requests:   reqs,
-		logger:     logger,
-		modelLabel: labels.NewModelLabel(labels.DefaultMaxCardinality),
-		pricing:    priceTable,
-		auth:       verifier,
-		authHeader: cfg.Auth.HeaderName(),
+		cfg:         cfg,
+		providers:   providers,
+		rps:         rps,
+		tracer:      prov.Tracer,
+		meters:      prov.Meters,
+		inflight:    infl,
+		requests:    reqs,
+		logger:      logger,
+		modelLabel:  labels.NewModelLabel(labels.DefaultMaxCardinality),
+		pricing:     priceTable,
+		auth:        verifier,
+		authHeader:  cfg.Auth.HeaderName(),
+		upstreamSem: upstreamSem,
 	}, nil
 }
 
@@ -192,6 +204,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+
+	// Per-upstream concurrency cap. Acquire BEFORE any body read or
+	// span/metric work so a flood doesn't waste those resources.
+	if sem := h.upstreamSem[upstream.Name]; sem != nil {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "upstream concurrency limit reached", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	prv := h.providers[upstream.Provider]
 	op := prv.OperationFor(r.URL.Path)
 

@@ -107,6 +107,13 @@ type Upstream struct {
 	Prefix   string `yaml:"prefix"`
 	Target   string `yaml:"target"`
 	Provider string `yaml:"provider"`
+	// MaxInFlight caps the concurrent in-flight requests llmtap will
+	// forward to this upstream. Above the cap the proxy replies
+	// 429 + Retry-After: 1 without contacting upstream. Zero (default)
+	// disables the cap. The fuse pairs with the per-upstream circuit
+	// breaker (A24, future) — without it, an upstream brownout
+	// consumes every goroutine + memory slice the proxy has.
+	MaxInFlight int `yaml:"max_in_flight"`
 }
 
 // Telemetry controls how llmtap exports its OTel signals.

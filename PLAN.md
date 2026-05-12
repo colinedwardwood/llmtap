@@ -1061,10 +1061,23 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   - Tests wire through `httptest.NewUnstartedServer` so the
     `ReadTimeout` knob (the A11 surface) is actually exercised.
 
-- [ ] **A12 — Per-upstream concurrency cap (item 1.5)** 🔴
+- [x] **A12 — Per-upstream concurrency cap (item 1.5)** 🔴
   **Finding:** No bound on in-flight requests per upstream; an
   upstream brownout drains all goroutines + memory.
-  **Fix:** Semaphore per upstream, 429 + `Retry-After` on overflow.
+  **Fix:** Added `Upstream.MaxInFlight int` config field (0 =
+  unlimited). At construction time `proxy.New` builds a buffered-chan
+  semaphore per upstream sized to the cap. In `ServeHTTP` (after
+  upstream match, before any body read or span/metric work) the
+  proxy non-blocking-acquires; over-cap responses get 429 with
+  `Retry-After: 1` and never reach the upstream. Buffered chan
+  keeps the dep footprint at zero.
+  **Evidence:**
+  - `TestUpstreamConcurrencyCapReturns429`: with `cap=3`, four
+    concurrent requests against a blocked upstream produce exactly
+    3 × 200 + 1 × 429; the 429 carries `Retry-After: 1`; upstream
+    sees exactly 3 hits.
+  - `TestUpstreamConcurrencyUnboundedByDefault`: `MaxInFlight=0`
+    lets 20 concurrent requests through without limit.
 
 - [ ] **A13 — Unbounded SSE buffer (item 1.6)** 🔴
   **Finding:** `sseTee.buf` grows without limit; an upstream sending
