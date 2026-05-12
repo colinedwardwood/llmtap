@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# llmtap pushes metrics via OTLP through the otel-collector to the
+# /api/v1/otlp endpoint enabled at startup; no scrape jobs needed for
+# llmtap itself.
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

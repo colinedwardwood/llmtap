@@ -1,0 +1,44 @@
+# Fans llmtap's OTLP signals out to Tempo (traces), Prometheus (metrics),
+# and Loki (logs). Self-instrumentation (otelhttp + otelslog) flows the same
+# way, so a "what's llmtap doing right now?" question has one answer in
+# Grafana.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: demo
+        action: upsert
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlphttp/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/loki]

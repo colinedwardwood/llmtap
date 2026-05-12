@@ -1,0 +1,41 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gocritic
+    - gofmt
+    - goimports
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nolintlint
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+  gosec:
+    excludes:
+      - G104  # err-check is handled by errcheck
+  revive:
+    rules:
+      - name: var-naming
+      - name: exported
+        disabled: true  # we use doc comments where they help, not as a religion
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck

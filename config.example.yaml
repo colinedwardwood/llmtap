@@ -1,0 +1,67 @@
+# llmtap config — see https://github.com/colinedwardwood/llmtap
+#
+# All scalar values are overridable from environment variables prefixed with
+# LLMTAP_. The structural sections (upstreams) belong here.
+
+# Address llmtap listens on. Clients point their *_BASE_URL at this address.
+# Default is loopback-only on purpose: a non-loopback bind requires either
+# TLS (below) or an explicit allow_insecure=true to acknowledge plaintext.
+listen: "127.0.0.1:4000"
+
+# Acknowledge serving plaintext on a non-loopback interface. Only set this
+# in trusted environments (sidecar, single-host docker bridge) where the
+# network between client and proxy is not reachable from outside.
+allow_insecure: false
+
+# Listener-side TLS termination. Setting cert_file + key_file flips llmtap
+# to HTTPS; clients then use OPENAI_BASE_URL=https://llmtap.internal/v1.
+# Setting client_ca_file additionally requires every client to present a
+# certificate chained to that CA (mTLS). This is the right knob when llmtap
+# is shared across services in a VPC.
+tls:
+  cert_file: ""        # e.g. /etc/llmtap/tls.crt
+  key_file:  ""        # e.g. /etc/llmtap/tls.key
+  client_ca_file: ""   # optional, enables required mTLS
+
+# Upstream LLM APIs. The first matching prefix (longest wins) routes the
+# request. Provider must be one of: openai | anthropic.
+upstreams:
+  - name: openai
+    prefix: /v1
+    target: https://api.openai.com
+    provider: openai
+
+  - name: anthropic
+    prefix: /anthropic
+    target: https://api.anthropic.com
+    provider: anthropic
+
+# OpenTelemetry export. Endpoint format depends on protocol:
+#   grpc: "host:4317"        (no scheme)
+#   http: "host:4318"        (no scheme; HTTPS implied unless insecure: true)
+telemetry:
+  endpoint: localhost:4317
+  protocol: grpc
+  insecure: true
+  sample_ratio: 1.0
+  timeout: 10s
+  # headers:
+  #   X-Scope-OrgID: tenant-1
+
+# Prompt/completion content capture. Default is "off" — only metadata
+# (model, tokens, finish reasons) leaves the proxy. Switch to "events" to
+# attach content as span events, or "logs" to send via the OTel log signal.
+# Anything other than "off" should be paired with redaction at your
+# collector or a tightly scoped retention window.
+content:
+  mode: off
+
+http:
+  read_header_timeout: 30s
+  idle_timeout: 120s
+  shutdown_timeout: 30s
+
+service:
+  name: llmtap
+  namespace: observability
+  environment: dev
