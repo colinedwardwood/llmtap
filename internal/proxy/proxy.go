@@ -23,6 +23,7 @@ import (
 
 	"github.com/colinedwardwood/llmtap/internal/config"
 	"github.com/colinedwardwood/llmtap/internal/genai"
+	"github.com/colinedwardwood/llmtap/internal/labels"
 	"github.com/colinedwardwood/llmtap/internal/pricing"
 	"github.com/colinedwardwood/llmtap/internal/provider"
 	"github.com/colinedwardwood/llmtap/internal/telemetry"
@@ -66,6 +67,11 @@ type Handler struct {
 	// Exposed via expvar-style debug if ever needed; the field exists so
 	// shutdown can wait for streams to drain instead of guessing.
 	activeStreams atomic.Int64
+
+	// modelLabel bounds the cardinality of gen_ai.{request,response}.model
+	// values on the metric path. Span attributes keep the raw model
+	// string — span cardinality is governed by retention.
+	modelLabel *labels.ModelLabel
 }
 
 // New builds a Handler from validated config and a Providers bundle. It
@@ -123,14 +129,15 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 	}
 
 	return &Handler{
-		cfg:       cfg,
-		providers: providers,
-		rps:       rps,
-		tracer:    prov.Tracer,
-		meters:    prov.Meters,
-		inflight:  infl,
-		requests:  reqs,
-		logger:    logger,
+		cfg:        cfg,
+		providers:  providers,
+		rps:        rps,
+		tracer:     prov.Tracer,
+		meters:     prov.Meters,
+		inflight:   infl,
+		requests:   reqs,
+		logger:     logger,
+		modelLabel: labels.NewModelLabel(labels.DefaultMaxCardinality),
 	}, nil
 }
 
@@ -213,10 +220,14 @@ func (h *Handler) responseInterceptor(
 	}
 
 	recordMetrics := func(ctx context.Context) {
+		// Bound model-label cardinality before it hits any metric. Pricing
+		// uses the raw model so snapshot suffixes still match the table.
+		reqModelLabel := h.modelLabel.Normalize(info.RequestModel)
+		respModelLabel := h.modelLabel.Normalize(info.ResponseModel)
 		attrs := metric.WithAttributes(
 			attribute.String(genai.AttrSystem, info.System),
 			attribute.String(genai.AttrOperationName, info.Operation),
-			attribute.String(genai.AttrRequestModel, info.RequestModel),
+			attribute.String(genai.AttrRequestModel, reqModelLabel),
 			attribute.String("upstream", upstreamName),
 			attribute.Int("http.response.status_code", statusCode),
 		)
@@ -231,7 +242,7 @@ func (h *Handler) responseInterceptor(
 			h.meters.TokenUsage.Record(ctx, info.InputTokens, metric.WithAttributes(
 				attribute.String(genai.AttrSystem, info.System),
 				attribute.String(genai.AttrOperationName, info.Operation),
-				attribute.String(genai.AttrRequestModel, info.RequestModel),
+				attribute.String(genai.AttrRequestModel, reqModelLabel),
 				attribute.String("token_type", genai.TokenTypeInput),
 			))
 		}
@@ -239,7 +250,7 @@ func (h *Handler) responseInterceptor(
 			h.meters.TokenUsage.Record(ctx, info.OutputTokens, metric.WithAttributes(
 				attribute.String(genai.AttrSystem, info.System),
 				attribute.String(genai.AttrOperationName, info.Operation),
-				attribute.String(genai.AttrRequestModel, info.RequestModel),
+				attribute.String(genai.AttrRequestModel, reqModelLabel),
 				attribute.String("token_type", genai.TokenTypeOutput),
 			))
 		}
@@ -250,8 +261,8 @@ func (h *Handler) responseInterceptor(
 		if usd, ok := pricing.Cost(info.System, model, info.InputTokens, info.OutputTokens); ok {
 			h.meters.CostUSD.Add(ctx, usd, metric.WithAttributes(
 				attribute.String(genai.AttrSystem, info.System),
-				attribute.String(genai.AttrRequestModel, info.RequestModel),
-				attribute.String(genai.AttrResponseModel, info.ResponseModel),
+				attribute.String(genai.AttrRequestModel, reqModelLabel),
+				attribute.String(genai.AttrResponseModel, respModelLabel),
 			))
 			span.SetAttributes(attribute.Float64(genai.AttrCostUSD, usd))
 		}

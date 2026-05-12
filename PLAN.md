@@ -802,13 +802,21 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 
 ## Critical (token exposure / operator infrastructure DoS) — fix first
 
-- [ ] **A1 — Metric label cardinality cap (item 0.7)** 🔴
+- [x] **A1 — Metric label cardinality cap (item 0.7)** 🔴
   **Finding:** `gen_ai.request.model` / `gen_ai.response.model` flow
   verbatim from client JSON into metric labels. Hostile or buggy
   clients mint unbounded Prometheus/Mimir series → operator o11y stack
   OOM.
-  **Fix:** Normalize + allow-list + hard cardinality cap at the
-  recording site; route overflow to `_other`.
+  **Fix:** New `internal/labels` package: lowercase + strip date /
+  version snapshot suffixes; admission via `sync.Map` with an atomic
+  counter capped at `DefaultMaxCardinality = 200`; overflow routed to
+  `_other`. Applied at every metric attribute site in
+  `proxy.recordMetrics`. Span attributes keep raw model strings.
+  **Evidence:** `TestProxyMetricsModelCardinalityIsBounded` fires
+  1000 distinct synthetic model names through the proxy and asserts
+  the recorded label set ≤ 201 (cap + `_other`) and includes
+  `_other`. Unit tests cover normalization, lowercasing, empty input,
+  cap engagement, and `-race` concurrency safety.
 
 - [ ] **A2 — Error body snippet leaks API key prefix (item 0.9)** 🔴
   **Finding:** On every 4xx/5xx, `http.response.body_snippet` (first
