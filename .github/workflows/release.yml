@@ -1,0 +1,259 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.23"
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ---------- Build cross-compiled binaries + checksums ----------
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          out="llmtap-${GOOS}-${GOARCH}"
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/colinedwardwood/llmtap/internal/buildinfo.Version=${VERSION} \
+              -X github.com/colinedwardwood/llmtap/internal/buildinfo.Commit=${COMMIT} \
+              -X github.com/colinedwardwood/llmtap/internal/buildinfo.Date=${DATE}" \
+            -o "$out" ./cmd/llmtap
+          sha256sum "$out" > "${out}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            llmtap-${{ matrix.goos }}-${{ matrix.goarch }}
+            llmtap-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+  # ---------- Aggregate per-matrix hashes into one base64 blob ----------
+  # slsa-github-generator/generator_generic_slsa3 takes a single
+  # base64-encoded `<sha256>  <filename>` list. Matrix outputs can't be
+  # passed directly to a reusable workflow, so we collect them here.
+  hashes:
+    name: aggregate hashes
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.aggregate.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - id: aggregate
+        run: |
+          cd dist
+          # Strip the .sha256 sidecars; the provenance is over the binaries.
+          h=$(sha256sum llmtap-linux-amd64 llmtap-linux-arm64 llmtap-darwin-arm64 | base64 -w0)
+          echo "hashes=${h}" >> "$GITHUB_OUTPUT"
+
+  # ---------- SLSA-3 provenance for the binaries ----------
+  provenance:
+    name: SLSA-3 provenance (binaries)
+    needs: hashes
+    permissions:
+      contents: write
+      id-token: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.hashes }}
+      upload-assets: false
+
+  # ---------- SBOM (CycloneDX) for the source tree + each binary ----------
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+      - name: Source-tree SBOM
+        run: syft dir:. -o cyclonedx-json=sbom-source.cdx.json
+      - name: Per-binary SBOMs
+        run: |
+          for bin in dist/llmtap-*; do
+            [[ "$bin" == *.sha256 ]] && continue
+            name=$(basename "$bin")
+            syft file:"$bin" -o cyclonedx-json="sbom-${name}.cdx.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sboms
+          path: sbom-*.cdx.json
+
+  # ---------- Cosign sign each binary (keyless via OIDC) ----------
+  sign-binaries:
+    name: cosign sign binaries
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      - name: Sign every binary
+        env:
+          COSIGN_YES: "true"
+        run: |
+          for bin in dist/llmtap-*; do
+            [[ "$bin" == *.sha256 ]] && continue
+            cosign sign-blob --yes "$bin" \
+              --output-signature "${bin}.sig" \
+              --output-certificate "${bin}.pem"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signatures
+          path: |
+            dist/*.sig
+            dist/*.pem
+
+  # ---------- Build + push the multi-arch container image to ghcr.io ----------
+  image:
+    name: container (ghcr.io)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          # docker/build-push-action embeds SLSA provenance and a
+          # CycloneDX SBOM into the image manifest list itself.
+          provenance: mode=max
+          sbom: true
+
+  # ---------- Cosign sign the pushed image ----------
+  sign-image:
+    name: cosign sign image
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      - name: Sign image
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign --yes "${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}"
+
+  # ---------- Bundle everything into a GitHub release ----------
+  release:
+    name: GitHub release
+    needs:
+      - build
+      - hashes
+      - provenance
+      - sbom
+      - sign-binaries
+      - image
+      - sign-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          # Binaries + checksums + cosign signatures.
+          find dist -type f \
+            \( -name 'llmtap-*' -o -name 'sbom-*.cdx.json' \) \
+            -exec cp {} release/ \;
+          # SLSA provenance attestation lands in its own artifact dir.
+          find dist -type f -name '*.intoto.jsonl' -exec cp {} release/ \; || true
+          ls -la release/
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release/*

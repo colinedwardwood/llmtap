@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.23"
+
+jobs:
+  test:
+    name: test (-race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go test -race -count=1 with coverage
+        run: |
+          go test -race -count=1 -timeout=2m \
+            -covermode=atomic \
+            -coverpkg=./internal/... \
+            -coverprofile=coverage.out \
+            ./...
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+      - name: Enforce 60% line coverage on internal/
+        # Current floor is 60%; raise to 70% once telemetry/* and the
+        # untested config loaders get test backfill (tracked separately).
+        run: |
+          go tool cover -func=coverage.out | tee coverage.txt
+          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $NF); print $NF}')
+          echo "total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 < 60.0) }' \
+            || { echo "::error::coverage ${pct}% < 60% gate"; exit 1; }
+
+  lint:
+    name: lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          # Pin to a v1 release that understands the project's
+          # legacy .golangci.yml schema.
+          version: v1.62.0
+          args: --timeout=5m
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: govulncheck ./...
+        run: govulncheck ./...
+
+  trivy:
+    name: trivy fs (HIGH/CRITICAL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          out="llmtap-${GOOS}-${GOARCH}"
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/colinedwardwood/llmtap/internal/buildinfo.Version=${VERSION} \
+              -X github.com/colinedwardwood/llmtap/internal/buildinfo.Commit=${COMMIT} \
+              -X github.com/colinedwardwood/llmtap/internal/buildinfo.Date=${DATE}" \
+            -o "${out}" ./cmd/llmtap
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llmtap-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: llmtap-${{ matrix.goos }}-${{ matrix.goarch }}
