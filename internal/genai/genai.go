@@ -62,10 +62,10 @@ const (
 
 // Metric instrument names (semconv GenAI metrics).
 const (
-	MetricTokenUsage         = "gen_ai.client.token.usage"
-	MetricOperationDuration  = "gen_ai.client.operation.duration"
-	MetricTimeToFirstToken   = "gen_ai.client.time_to_first_token"
-	MetricCostUSD            = "gen_ai.client.cost.usd" // llmtap extension
+	MetricTokenUsage        = "gen_ai.client.token.usage"
+	MetricOperationDuration = "gen_ai.client.operation.duration"
+	MetricTimeToFirstToken  = "gen_ai.client.time_to_first_token"
+	MetricCostUSD           = "gen_ai.client.cost.usd" // llmtap extension
 )
 
 // Token-type label values for MetricTokenUsage.

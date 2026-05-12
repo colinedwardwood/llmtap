@@ -20,19 +20,19 @@ import (
 // Zero values mean "unknown" (e.g. tokens=0 from a 4xx, finish reasons empty
 // when streaming aborted). The proxy reports only fields that are known.
 type Info struct {
-	System         string
-	Operation      string
-	RequestModel   string
-	ResponseModel  string
-	ResponseID     string
-	FinishReasons  []string
-	InputTokens    int64
-	OutputTokens   int64
-	Stream         bool
-	Started        time.Time
-	FirstByteAt    time.Time // wall-clock of first response byte; zero if not measured
-	FirstTokenAt   time.Time // wall-clock of first content delta in stream; zero if non-streaming
-	Finished       time.Time
+	System        string
+	Operation     string
+	RequestModel  string
+	ResponseModel string
+	ResponseID    string
+	FinishReasons []string
+	InputTokens   int64
+	OutputTokens  int64
+	Stream        bool
+	Started       time.Time
+	FirstByteAt   time.Time // wall-clock of first response byte; zero if not measured
+	FirstTokenAt  time.Time // wall-clock of first content delta in stream; zero if non-streaming
+	Finished      time.Time
 }
 
 // DurationSeconds returns Finished-Started in seconds; 0 if either is zero.

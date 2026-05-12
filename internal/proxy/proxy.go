@@ -561,9 +561,7 @@ func (h *Handler) checkAuth(r *http.Request) bool {
 	// Accept either `Bearer <token>` or a bare token, so operators
 	// can choose between matching standard reverse-proxy convention
 	// and using a custom header naked.
-	if strings.HasPrefix(raw, "Bearer ") {
-		raw = strings.TrimPrefix(raw, "Bearer ")
-	}
+	raw = strings.TrimPrefix(raw, "Bearer ")
 	return h.auth.Verify(raw)
 }
 

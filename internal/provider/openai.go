@@ -34,19 +34,19 @@ func (OpenAI) OperationFor(urlPath string) string {
 }
 
 type openAIRequest struct {
-	Model            string         `json:"model"`
+	Model            string          `json:"model"`
 	Messages         []openAIMessage `json:"messages"`
 	Input            json.RawMessage `json:"input"` // embeddings: string or [string]
-	Temperature      *float64       `json:"temperature,omitempty"`
-	TopP             *float64       `json:"top_p,omitempty"`
-	MaxTokens        *int64         `json:"max_tokens,omitempty"`
-	MaxComplTokens   *int64         `json:"max_completion_tokens,omitempty"`
-	FrequencyPenalty *float64       `json:"frequency_penalty,omitempty"`
-	PresencePenalty  *float64       `json:"presence_penalty,omitempty"`
-	Seed             *int64         `json:"seed,omitempty"`
+	Temperature      *float64        `json:"temperature,omitempty"`
+	TopP             *float64        `json:"top_p,omitempty"`
+	MaxTokens        *int64          `json:"max_tokens,omitempty"`
+	MaxComplTokens   *int64          `json:"max_completion_tokens,omitempty"`
+	FrequencyPenalty *float64        `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64        `json:"presence_penalty,omitempty"`
+	Seed             *int64          `json:"seed,omitempty"`
 	Stop             json.RawMessage `json:"stop,omitempty"`
-	Stream           bool           `json:"stream,omitempty"`
-	EncodingFormat   string         `json:"encoding_format,omitempty"`
+	Stream           bool            `json:"stream,omitempty"`
+	EncodingFormat   string          `json:"encoding_format,omitempty"`
 }
 
 type openAIMessage struct {
@@ -159,10 +159,10 @@ type openAIResponse struct {
 }
 
 type openAIChoice struct {
-	Index        int            `json:"index"`
-	Message      openAIMessage  `json:"message"`
-	Delta        openAIMessage  `json:"delta"`
-	FinishReason string         `json:"finish_reason"`
+	Index        int           `json:"index"`
+	Message      openAIMessage `json:"message"`
+	Delta        openAIMessage `json:"delta"`
+	FinishReason string        `json:"finish_reason"`
 }
 
 type openAIUsage struct {

@@ -222,7 +222,7 @@ func Load(path string) (Config, error) {
 	cfg := Default()
 
 	if path != "" {
-		raw, err := os.ReadFile(path) //nolint:gosec // operator supplies the path
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			return Config{}, fmt.Errorf("read config %q: %w", path, err)
 		}

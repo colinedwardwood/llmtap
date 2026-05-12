@@ -67,7 +67,7 @@ func Load(path string, failOpen bool) (*Table, error) {
 	if path == "" {
 		return Default(), nil
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // operator supplies the path
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if failOpen {
 			return Default(), nil

@@ -1,14 +1,14 @@
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - gocritic
-    - gofmt
-    - goimports
     - gosec
     - govet
     - ineffassign
@@ -19,23 +19,33 @@ linters:
     - unconvert
     - unused
 
-linters-settings:
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-  gosec:
-    excludes:
-      - G104  # err-check is handled by errcheck
-  revive:
-    rules:
-      - name: var-naming
-      - name: exported
-        disabled: true  # we use doc comments where they help, not as a religion
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    gosec:
+      excludes:
+        - G104  # err-check is handled by errcheck
+        - G101  # false positive on attribute-key constants
+                # ("gen_ai.request.*") and the argon2id PHC prefix
+        - G115  # uint32(len(p.key)) is bounded by the argon2id key
+                # length constant, not an attacker-controlled length
+        - G304  # config / pricing files are operator-supplied paths
+    revive:
+      rules:
+        - name: var-naming
+        - name: exported
+          disabled: true  # use doc comments where they help, not as a religion
 
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gosec
-        - errcheck
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
