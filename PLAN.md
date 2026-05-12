@@ -1079,11 +1079,23 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   - `TestUpstreamConcurrencyUnboundedByDefault`: `MaxInFlight=0`
     lets 20 concurrent requests through without limit.
 
-- [ ] **A13 — Unbounded SSE buffer (item 1.6)** 🔴
+- [x] **A13 — Unbounded SSE buffer (item 1.6)** 🔴
   **Finding:** `sseTee.buf` grows without limit; an upstream sending
   a single event without `\n\n` terminator OOMs the process.
-  **Fix:** Hard cap; drop parser state on overflow but keep
-  forwarding bytes.
+  **Fix:** New `maxEventBytes = 1 MiB` ceiling on the in-flight
+  parser buffer. When the buffer exceeds the cap, `sseTee.Read`
+  resets the accumulator, fires a one-shot `onOverflow` callback
+  (provider closures attach a `llmtap.sse_parser_overflow` span
+  event), and continues forwarding bytes to the client untouched.
+  Parsing is allowed to give up; forwarding is not. Subsequent
+  well-formed events resume parsing normally.
+  **Evidence:**
+  - `TestSSETeeBoundsBufferUnderOverflow`: a 10 MiB no-separator
+    payload forwards in full (no client bytes lost) and triggers
+    `onOverflow`.
+  - `TestSSETeeResumesParsingAfterOverflow`: a junk prefix > 1 MiB
+    followed by a clean `data: hello\n\n` frame fires overflow AND
+    dispatches the post-overflow event with data="hello".
 
 - [ ] **A14 — Demo compose teaches `allow_insecure=true` (item 3.7)** 🔴
   **Finding:** First example operators ever run sets the insecure

@@ -306,7 +306,8 @@ func (OpenAI) WrapStream(
 		onDone()
 	}
 
-	return newSSETee(body, onEvent, closer)
+	overflow := func() { span.AddEvent("llmtap.sse_parser_overflow") }
+	return newSSETee(body, onEvent, overflow, closer)
 }
 
 var _ Provider = (*OpenAI)(nil)

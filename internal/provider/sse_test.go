@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"io"
 	"strings"
 	"testing"
@@ -33,6 +34,7 @@ func TestSSETeeForwardsAndParses(t *testing.T) {
 		func(event string, data []byte) {
 			got = append(got, captured{event: event, data: string(data)})
 		},
+		nil, // onOverflow
 		func() { closed++ },
 	)
 
@@ -61,6 +63,75 @@ func TestSSETeeForwardsAndParses(t *testing.T) {
 	}
 }
 
+// TestSSETeeBoundsBufferUnderOverflow is the A13 regression. A
+// pathological upstream that streams MiB of bytes without ever
+// emitting a `\n\n` event terminator must not OOM the proxy. Bytes
+// still forward to the client unchanged; parsing is allowed to give
+// up via a one-shot overflow signal.
+func TestSSETeeBoundsBufferUnderOverflow(t *testing.T) {
+	t.Parallel()
+
+	// 10 MiB of payload, no event separators anywhere.
+	payload := bytes.Repeat([]byte("x"), 10*1024*1024)
+	src := io.NopCloser(bytes.NewReader(payload))
+
+	var overflows int
+	tee := newSSETee(src,
+		func(event string, data []byte) {},
+		func() { overflows++ },
+		func() {})
+
+	out, err := io.ReadAll(tee)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != len(payload) {
+		t.Errorf("forwarded %d bytes, want %d (proxy must not drop client bytes on parser overflow)", len(out), len(payload))
+	}
+	if overflows == 0 {
+		t.Error("expected onOverflow callback to fire at least once on no-separator payload")
+	}
+}
+
+// TestSSETeeResumesParsingAfterOverflow asserts that the parser
+// recovers once the upstream resumes emitting proper SSE frames. The
+// overflow is a soft state — drop the unparseable accumulator,
+// keep parsing what comes next.
+func TestSSETeeResumesParsingAfterOverflow(t *testing.T) {
+	t.Parallel()
+
+	junk := bytes.Repeat([]byte("x"), 2*1024*1024) // > maxEventBytes
+	frame := []byte("\n\ndata: hello\n\n")
+	src := io.NopCloser(bytes.NewReader(append(junk, frame...)))
+
+	var (
+		overflows int
+		got       []captured
+	)
+	tee := newSSETee(src,
+		func(event string, data []byte) {
+			got = append(got, captured{event: event, data: string(data)})
+		},
+		func() { overflows++ },
+		func() {})
+
+	if _, err := io.ReadAll(tee); err != nil {
+		t.Fatal(err)
+	}
+	if overflows == 0 {
+		t.Error("expected overflow to fire for the junk prefix")
+	}
+	var foundHello bool
+	for _, ev := range got {
+		if ev.data == "hello" {
+			foundHello = true
+		}
+	}
+	if !foundHello {
+		t.Errorf("post-overflow event \"hello\" not dispatched; got %+v", got)
+	}
+}
+
 func TestSSETeeFlushesTrailingPartial(t *testing.T) {
 	t.Parallel()
 
@@ -70,6 +141,7 @@ func TestSSETeeFlushesTrailingPartial(t *testing.T) {
 		func(event string, data []byte) {
 			got = append(got, captured{event: event, data: string(data)})
 		},
+		nil, // onOverflow
 		func() {},
 	)
 	if _, err := io.ReadAll(tee); err != nil {

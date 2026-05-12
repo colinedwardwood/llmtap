@@ -6,6 +6,13 @@ import (
 	"sync"
 )
 
+// maxEventBytes caps the in-flight SSE-parse buffer per stream. Real
+// provider events are kilobytes at most; anything bigger is a sign of
+// an upstream stuck in a non-SSE state (or actively trying to OOM the
+// proxy). On overflow the buffer is dropped and onOverflow fires; bytes
+// keep forwarding to the client unchanged — only the parser gives up.
+const maxEventBytes = 1024 * 1024 // 1 MiB
+
 // sseTee wraps an upstream io.ReadCloser, forwarding bytes unchanged to the
 // caller while parsing SSE messages out-of-band. It guarantees onClose runs
 // exactly once: whichever of EOF, transport error, or Close arrives first.
@@ -14,22 +21,37 @@ import (
 // request goroutine; staying single-threaded avoids a goroutine per in-flight
 // request and removes a class of leak.
 type sseTee struct {
-	src     io.ReadCloser
-	buf     bytes.Buffer
-	onEvent func(event string, data []byte)
-	onClose func()
-	once    sync.Once
+	src        io.ReadCloser
+	buf        bytes.Buffer
+	onEvent    func(event string, data []byte)
+	onOverflow func() // optional; called once when buf exceeds maxEventBytes
+	onClose    func()
+	once       sync.Once
+	overflowed bool
 }
 
-func newSSETee(src io.ReadCloser, onEvent func(event string, data []byte), onClose func()) *sseTee {
-	return &sseTee{src: src, onEvent: onEvent, onClose: onClose}
+func newSSETee(src io.ReadCloser, onEvent func(event string, data []byte), onOverflow, onClose func()) *sseTee {
+	return &sseTee{src: src, onEvent: onEvent, onOverflow: onOverflow, onClose: onClose}
 }
 
 func (t *sseTee) Read(p []byte) (int, error) {
 	n, err := t.src.Read(p)
 	if n > 0 {
 		_, _ = t.buf.Write(p[:n])
-		t.drain(false)
+		if t.buf.Len() > maxEventBytes {
+			// Pathological / hostile stream — drop accumulator and
+			// announce overflow once. Bytes still flow to the client
+			// via the n we return; only the SSE parser gives up.
+			t.buf.Reset()
+			if !t.overflowed {
+				t.overflowed = true
+				if t.onOverflow != nil {
+					t.onOverflow()
+				}
+			}
+		} else {
+			t.drain(false)
+		}
 	}
 	if err != nil {
 		t.drain(true)
