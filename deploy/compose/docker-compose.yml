@@ -1,5 +1,6 @@
 # Local LGTM-mini stack for demoing llmtap. Brings up:
-#   - llmtap          :4000   the proxy
+#   - tls-init        one-shot, generates a self-signed cert into a volume
+#   - llmtap          :4443   the proxy (HTTPS, self-signed cert)
 #   - otel-collector  :4317   OTLP gRPC + :4318 OTLP HTTP (fan-out)
 #   - tempo           :3200   distributed tracing
 #   - prometheus      :9090   metrics
@@ -8,30 +9,63 @@
 #
 # Quick start (from repo root):
 #   make compose-up
-#   export OPENAI_BASE_URL=http://localhost:4000/v1
-#   <run any OpenAI-compatible client>
-#   open http://localhost:3000  (admin / admin)
+#   # Trust the self-signed cert OR use curl -k. With the OpenAI Python SDK,
+#   # set OPENAI_BASE_URL=https://localhost:4443/v1 and either install the
+#   # cert in the trust store or set REQUESTS_CA_BUNDLE / SSL_CERT_FILE to
+#   # ./deploy/compose/data/tls/tls.crt.
+#   open http://localhost:3000   # admin / admin
 #
+# If you really want plaintext loopback for a 30-second demo, use
+# `make compose-up-insecure` instead — see the override file.
 services:
+  tls-init:
+    image: alpine:3.20
+    volumes:
+      - tls-data:/tls
+    # Idempotent: regenerate only when the cert is missing. SAN covers
+    # both localhost and 127.0.0.1 so clients have a sane match.
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ ! -f /tls/tls.crt ]; then
+          apk add --no-cache openssl > /dev/null
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tls/tls.key -out /tls/tls.crt -days 365 \
+            -subj "/CN=llmtap.local" \
+            -addext "subjectAltName=DNS:localhost,DNS:llmtap,IP:127.0.0.1"
+          chmod 644 /tls/tls.crt /tls/tls.key
+          echo "tls-init: generated self-signed cert at /tls/tls.crt"
+        else
+          echo "tls-init: reusing existing /tls/tls.crt"
+        fi
+
   llmtap:
     build:
       context: ../..
       dockerfile: Dockerfile
     image: llmtap:dev
     ports:
-      - "4000:4000"
+      - "4443:4443"
     environment:
-      LLMTAP_LISTEN: "0.0.0.0:4000"
-      # Demo stack only: this exposes plaintext :4000 on the docker bridge so
-      # the host can reach it. In any real deployment configure tls.cert_file
-      # and tls.key_file (see deploy/compose/README for an mTLS example).
-      LLMTAP_ALLOW_INSECURE: "true"
+      LLMTAP_LISTEN: "0.0.0.0:4443"
+      LLMTAP_TLS_CERT_FILE: "/etc/llmtap/tls/tls.crt"
+      LLMTAP_TLS_KEY_FILE: "/etc/llmtap/tls/tls.key"
       LLMTAP_OTLP_ENDPOINT: "otel-collector:4317"
       LLMTAP_OTLP_PROTOCOL: "grpc"
+      # otel-collector is on the docker network, not WAN — plaintext OTLP
+      # is fine here and the new A9 validator accepts the loopback/RFC1918
+      # range. The flag below is only required if the operator points
+      # LLMTAP_OTLP_ENDPOINT at something off-network.
       LLMTAP_OTLP_INSECURE: "true"
       LLMTAP_CAPTURE: "off"
       LLMTAP_ENV: "demo"
+    volumes:
+      - tls-data:/etc/llmtap/tls:ro
     depends_on:
+      tls-init:
+        condition: service_completed_successfully
       otel-collector:
         condition: service_started
 
@@ -84,3 +118,6 @@ services:
       - tempo
       - prometheus
       - loki
+
+volumes:
+  tls-data:

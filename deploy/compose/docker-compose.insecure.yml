@@ -1,0 +1,26 @@
+# Plaintext-loopback override for the demo stack. Apply with:
+#   docker compose -f docker-compose.yml -f docker-compose.insecure.yml up -d
+# or via the Makefile target:
+#   make compose-up-insecure
+#
+# Replaces the TLS-on-:4443 default with plaintext-on-:4000 +
+# LLMTAP_ALLOW_INSECURE=true. Use this only for a 30-second
+# `curl http://localhost:4000/v1/...` demo — it teaches the wrong
+# trust model for production, which is exactly what A14 was fixing.
+services:
+  llmtap:
+    ports: !override
+      - "4000:4000"
+    environment:
+      LLMTAP_LISTEN: "0.0.0.0:4000"
+      LLMTAP_ALLOW_INSECURE: "true"
+      LLMTAP_TLS_CERT_FILE: ""
+      LLMTAP_TLS_KEY_FILE: ""
+      LLMTAP_OTLP_ENDPOINT: "otel-collector:4317"
+      LLMTAP_OTLP_PROTOCOL: "grpc"
+      LLMTAP_OTLP_INSECURE: "true"
+      LLMTAP_CAPTURE: "off"
+      LLMTAP_ENV: "demo"
+    depends_on:
+      otel-collector:
+        condition: service_started

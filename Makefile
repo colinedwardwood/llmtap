@@ -18,7 +18,7 @@ GO       ?= go
 GOFLAGS  ?= -trimpath
 TESTOPTS ?= -race -count=1 -timeout=60s
 
-.PHONY: all build run test lint vet tidy fmt clean docker docker-build docker-push compose-up compose-down release
+.PHONY: all build run test lint vet tidy fmt clean docker docker-build docker-push compose-up compose-up-insecure compose-down release
 
 all: lint test build
 
@@ -69,8 +69,21 @@ docker-build:
 	  --build-arg BUILD_DATE=$(BUILD_DATE) \
 	  -t llmtap:$(VERSION) -t llmtap:latest .
 
+# Brings up the demo stack with llmtap listening on HTTPS :4443. The
+# self-signed cert is generated on first run by the tls-init sidecar.
+# Clients point OPENAI_BASE_URL=https://localhost:4443/v1 and either
+# trust the cert or pass `curl -k`.
 compose-up:
 	docker compose -f deploy/compose/docker-compose.yml up -d --build
+
+# Plaintext-loopback escape hatch — only for a 30-second
+# `curl http://localhost:4000/v1/...` demo. Teaches the wrong trust
+# model for production. Prefer `compose-up` everywhere else.
+compose-up-insecure:
+	docker compose \
+	  -f deploy/compose/docker-compose.yml \
+	  -f deploy/compose/docker-compose.insecure.yml \
+	  up -d --build
 
 compose-down:
 	docker compose -f deploy/compose/docker-compose.yml down -v

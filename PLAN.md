@@ -1097,11 +1097,26 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
     followed by a clean `data: hello\n\n` frame fires overflow AND
     dispatches the post-overflow event with data="hello".
 
-- [ ] **A14 — Demo compose teaches `allow_insecure=true` (item 3.7)** 🔴
+- [x] **A14 — Demo compose teaches `allow_insecure=true` (item 3.7)** 🔴
   **Finding:** First example operators ever run sets the insecure
   bypass. Copy-paste from demo to prod = open relay.
-  **Fix:** Demo stack uses TLS with a self-signed cert by default;
-  insecure mode behind a separate `make` target.
+  **Fix:** New `tls-init` one-shot service generates a self-signed
+  cert (RSA-2048, CN=llmtap.local, SAN={localhost, 127.0.0.1, llmtap})
+  into a `tls-data` named volume. The llmtap service mounts the
+  volume read-only at `/etc/llmtap/tls`, listens on `:4443` with
+  `LLMTAP_TLS_CERT_FILE` + `LLMTAP_TLS_KEY_FILE` set, and waits on
+  `tls-init` via `service_completed_successfully`. Cert generation
+  is idempotent (skipped on subsequent `up`s). `LLMTAP_ALLOW_INSECURE`
+  is gone from the default path.
+  Plaintext-loopback escape hatch lives in a new
+  `deploy/compose/docker-compose.insecure.yml` override and a
+  `make compose-up-insecure` target — explicitly opt-in for users
+  who want a 30-second `curl http://localhost:4000/...` demo.
+  **Evidence:** `docker compose config --quiet` validates both the
+  default and override-merged configs. The merged insecure config
+  shows `LLMTAP_LISTEN: 0.0.0.0:4000`, `LLMTAP_ALLOW_INSECURE: "true"`,
+  empty `LLMTAP_TLS_CERT_FILE` — matches the documented escape-hatch
+  semantics.
 
 - [ ] **A15 — No CI / unsigned releases (item 3.1)** 🔴
   **Finding:** Every protection in this plan is on the honor system
