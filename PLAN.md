@@ -959,10 +959,26 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
     `fail_open=false`.
   - `config.example.yaml` documents the new `pricing:` section.
 
-- [ ] **A8 — `--log-level` is a no-op (item 0.8)** 🔴
+- [x] **A8 — `--log-level` is a no-op (item 0.8)** 🔴
   **Finding:** `slog.SetLogLoggerLevel` does not affect the otelslog
   handler; all log levels produce identical output.
-  **Fix:** Thread a `slog.LevelVar` through the handler.
+  **Fix:** Extracted `newLogger(level, name, version, stderr)` from
+  `runUp`. Parses the level into a `slog.LevelVar`, builds a leveled
+  `slog.TextHandler` against stderr and a `leveledHandler` wrapping
+  the otelslog bridge (which has no native level option in the pinned
+  SDK), then combines both via a `multiHandler` so records dispatch
+  to both sinks under the same level. Deleted the rationalizing
+  `setLevel` no-op and its misleading comment.
+  **Evidence:** Five tests in `cmd/llmtap/logger_test.go`:
+  - `TestNewLoggerRespectsLevelInfo` — debug records filtered, info
+    records pass.
+  - `TestNewLoggerRespectsLevelError` — info+warn filtered, error
+    passes.
+  - `TestNewLoggerInvalidLevel` — unknown level returns an error.
+  - `TestNewLoggerEmptyLevelDefaultsToInfo` — empty string maps to
+    info, matching the original behaviour.
+  - `TestNewLoggerAttachesServiceAttrs` — `service.name` and
+    `service.version` present on every record.
 
 - [ ] **A9 — Insecure OTLP + WAN endpoint silently leaks (item 1.7)** 🔴
   **Finding:** `Default.Telemetry.Insecure: true` paired with an

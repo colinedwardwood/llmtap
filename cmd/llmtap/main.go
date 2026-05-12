@@ -97,15 +97,8 @@ func runUp(args []string, stderr io.Writer) error {
 		return fmt.Errorf("telemetry: %w", err)
 	}
 
-	// otelslog bridges slog → OTel logs once telemetry is up; until then we
-	// log to stderr so misconfigurations are visible.
-	logger := slog.New(otelslog.NewHandler("llmtap",
-		otelslog.WithSource(true),
-	)).With(
-		slog.String("service.name", cfg.Service.Name),
-		slog.String("service.version", buildinfo.Version),
-	)
-	if err := setLevel(*logLevel); err != nil {
+	logger, err := newLogger(*logLevel, cfg.Service.Name, buildinfo.Version, stderr)
+	if err != nil {
 		return err
 	}
 	slog.SetDefault(logger)
@@ -138,10 +131,20 @@ func runUp(args []string, stderr io.Writer) error {
 	return runErr
 }
 
-// setLevel mutates the default slog level. Kept tiny: the otelslog handler
-// honours LevelVar via the standard slog plumbing, but the bridge does not
-// expose a setter directly, so we use the global default level.
-func setLevel(level string) error {
+// newLogger constructs the process logger. It fans records out to two
+// sinks via a multiHandler:
+//
+//   - A leveled slog.TextHandler on stderr, so operators see logs in
+//     the terminal subject to the --log-level filter.
+//   - The otelslog bridge, wrapped with a leveling filter, so OTLP
+//     export honours the same level.
+//
+// Both sinks share a single slog.LevelVar so changing the level changes
+// both paths in lockstep. The otelslog handler has no native level
+// option in the pinned SDK version, hence the explicit leveledHandler
+// wrap — a no-op setter like slog.SetLogLoggerLevel does NOT filter the
+// bridge.
+func newLogger(level, serviceName, serviceVersion string, stderr io.Writer) (*slog.Logger, error) {
 	var lvl slog.Level
 	switch level {
 	case "debug":
@@ -153,11 +156,90 @@ func setLevel(level string) error {
 	case "error":
 		lvl = slog.LevelError
 	default:
-		return fmt.Errorf("invalid log level %q", level)
+		return nil, fmt.Errorf("invalid log level %q", level)
 	}
-	// stdlib slog's default level is governed by handlers; for otelslog the
-	// bridge respects level on emit. Calling SetLogLoggerLevel keeps the
-	// stdlib log package consistent for any indirect consumers.
-	slog.SetLogLoggerLevel(lvl)
-	return nil
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(lvl)
+
+	textHandler := slog.NewTextHandler(stderr, &slog.HandlerOptions{
+		Level:     levelVar,
+		AddSource: true,
+	})
+	otelHandler := &leveledHandler{
+		next: otelslog.NewHandler("llmtap", otelslog.WithSource(true)),
+		lvl:  levelVar,
+	}
+
+	multi := multiHandler{textHandler, otelHandler}
+	return slog.New(multi).With(
+		slog.String("service.name", serviceName),
+		slog.String("service.version", serviceVersion),
+	), nil
+}
+
+// leveledHandler wraps a downstream slog.Handler with a level filter.
+// Used to give the otelslog bridge a level-aware shape since the bridge
+// itself emits every record it sees.
+type leveledHandler struct {
+	next slog.Handler
+	lvl  *slog.LevelVar
+}
+
+func (h *leveledHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.lvl.Level()
+}
+
+func (h *leveledHandler) Handle(ctx context.Context, r slog.Record) error {
+	return h.next.Handle(ctx, r)
+}
+
+func (h *leveledHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &leveledHandler{next: h.next.WithAttrs(attrs), lvl: h.lvl}
+}
+
+func (h *leveledHandler) WithGroup(name string) slog.Handler {
+	return &leveledHandler{next: h.next.WithGroup(name), lvl: h.lvl}
+}
+
+// multiHandler dispatches each record to every underlying handler whose
+// Enabled returns true for the record's level. Errors from individual
+// handlers are joined so a misbehaving sink can't drop the rest.
+type multiHandler []slog.Handler
+
+func (m multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	for _, h := range m {
+		if h.Enabled(ctx, l) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	var errs []error
+	for _, h := range m {
+		if !h.Enabled(ctx, r.Level) {
+			continue
+		}
+		if err := h.Handle(ctx, r); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	out := make(multiHandler, len(m))
+	for i, h := range m {
+		out[i] = h.WithAttrs(attrs)
+	}
+	return out
+}
+
+func (m multiHandler) WithGroup(name string) slog.Handler {
+	out := make(multiHandler, len(m))
+	for i, h := range m {
+		out[i] = h.WithGroup(name)
+	}
+	return out
 }
