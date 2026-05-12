@@ -336,11 +336,18 @@ func (h *Handler) responseInterceptor(
 		if isEventStream(resp.Header) {
 			h.activeStreams.Add(1)
 			info.Stream = true
+			// Keep the request's trace context alive for the metric
+			// emission that finalize will do when the stream closes.
+			// `context.WithoutCancel` preserves baggage/span context
+			// while detaching from the request's cancellation chain —
+			// metrics for a completed stream should fire even if the
+			// client has already disconnected.
+			streamCtx := context.WithoutCancel(resp.Request.Context())
 			resp.Body = prv.WrapStream(span, info, resp.Body, captureContent,
 				func() {}, // first-token bookkeeping is internal to provider
 				func() {
 					h.activeStreams.Add(-1)
-					finalize(context.Background())
+					finalize(streamCtx)
 				},
 			)
 			return nil

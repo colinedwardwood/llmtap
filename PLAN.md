@@ -901,11 +901,19 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
     `TestErrorBodySnippetAttachedWhenContentEvents`,
     `TestErrorBodySizeAttachedAlways`) all stay green.
 
-- [ ] **A5 — Streaming metrics lose trace context (item 0.3)** 🔴
+- [x] **A5 — Streaming metrics lose trace context (item 0.3)** 🔴
   **Finding:** Streaming `finalize` is invoked with
   `context.Background()`, so every streaming-emitted metric has no
   exemplar link back to its span. Defeats the project's main pitch.
-  **Fix:** Capture per-request `ctx` in the streaming closer.
+  **Fix:** Captured `streamCtx := context.WithoutCancel(resp.Request.Context())`
+  inside `modify` and passed it to `finalize` from the WrapStream
+  onClose callback. `WithoutCancel` preserves the trace context while
+  detaching from request-side cancellation, so the metric emission
+  still fires after the client disconnects.
+  **Evidence:** `TestStreamingMetricsCarryTraceContext` records a
+  streaming chat, pulls the duration histogram exemplar from the
+  ManualReader, and asserts its `TraceID` equals the span's `TraceID`.
+  Before the fix, no exemplar carried a trace context at all.
 
 - [ ] **A6 — Gzipped responses record zero tokens (item 0.4)** 🔴
   **Finding:** When clients set `Accept-Encoding: gzip`, the JSON
