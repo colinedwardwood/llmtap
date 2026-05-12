@@ -22,3 +22,6 @@ config.yaml
 
 # Docker volume data (compose stack)
 deploy/compose/data/
+
+# Local agent / Claude Code harness state
+.claude/
