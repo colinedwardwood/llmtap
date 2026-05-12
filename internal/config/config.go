@@ -29,6 +29,21 @@ type Config struct {
 	HTTP          HTTPTimeouts   `yaml:"http"`
 	Service       Service        `yaml:"service"`
 	Request       Request        `yaml:"request"`
+	Pricing       Pricing        `yaml:"pricing"`
+}
+
+// Pricing overrides the built-in cost catalogue with operator-supplied
+// rates. Production deployments should point Path at a YAML file
+// matching `internal/pricing/prices.yaml`'s shape; the override is
+// merged on top of the built-ins so unspecified models keep their
+// default rate.
+type Pricing struct {
+	// Path is the YAML override file. Empty = use built-ins only.
+	Path string `yaml:"path"`
+	// FailOpen, when true, swallows file-missing / malformed errors and
+	// falls back to the built-in catalogue. When false (the default),
+	// such errors fail the process so the operator notices.
+	FailOpen bool `yaml:"fail_open"`
 }
 
 // Request shapes the proxy's handling of inbound request bodies.

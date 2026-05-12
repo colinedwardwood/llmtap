@@ -1,0 +1,64 @@
+# Built-in pricing catalogue. Values are the public list price at time
+# of release (snapshot 2025-Q4). Operators should override via
+# `pricing.path` in config for negotiated rates.
+#
+# Schema: system → model-prefix → {input_usd_per_mtok, output_usd_per_mtok}
+# Lookup is longest-prefix-match against the request/response model
+# string, so snapshot pins (e.g. "gpt-4o-mini-2024-07-18") inherit
+# their family's rate.
+
+openai:
+  gpt-4o-mini:
+    input_usd_per_mtok: 0.150
+    output_usd_per_mtok: 0.600
+  gpt-4o:
+    input_usd_per_mtok: 2.500
+    output_usd_per_mtok: 10.000
+  gpt-4-turbo:
+    input_usd_per_mtok: 10.000
+    output_usd_per_mtok: 30.000
+  gpt-4:
+    input_usd_per_mtok: 30.000
+    output_usd_per_mtok: 60.000
+  gpt-3.5-turbo:
+    input_usd_per_mtok: 0.500
+    output_usd_per_mtok: 1.500
+  o1-mini:
+    input_usd_per_mtok: 3.000
+    output_usd_per_mtok: 12.000
+  o1-preview:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 60.000
+  o1:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 60.000
+  o3-mini:
+    input_usd_per_mtok: 1.100
+    output_usd_per_mtok: 4.400
+  # Embedding models price per input only; output is conventionally 0.
+  text-embedding-3-small:
+    input_usd_per_mtok: 0.020
+    output_usd_per_mtok: 0
+  text-embedding-3-large:
+    input_usd_per_mtok: 0.130
+    output_usd_per_mtok: 0
+  text-embedding-ada-002:
+    input_usd_per_mtok: 0.100
+    output_usd_per_mtok: 0
+
+anthropic:
+  claude-3-5-haiku:
+    input_usd_per_mtok: 0.800
+    output_usd_per_mtok: 4.000
+  claude-3-5-sonnet:
+    input_usd_per_mtok: 3.000
+    output_usd_per_mtok: 15.000
+  claude-3-opus:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 75.000
+  claude-3-sonnet:
+    input_usd_per_mtok: 3.000
+    output_usd_per_mtok: 15.000
+  claude-3-haiku:
+    input_usd_per_mtok: 0.250
+    output_usd_per_mtok: 1.250

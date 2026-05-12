@@ -1,22 +1,114 @@
 // Package pricing converts (system, model, tokens) into USD cost.
 //
-// Prices are denominated per million tokens, matching how upstream providers
-// publish them. Unknown models return (0, false); callers should not record a
-// cost in that case so dashboards stay honest.
+// Prices are denominated per million tokens, matching how upstream
+// providers publish them. The built-in catalogue is the embedded
+// `prices.yaml`; operators override per their negotiated rate by
+// pointing `pricing.path` at a YAML file with the same shape — the
+// file is merged on top of the built-ins, leaving unspecified model
+// families at their default rates. Unknown models return (0, false);
+// callers should not record a cost in that case so dashboards stay
+// honest.
 package pricing
 
-import "strings"
+import (
+	_ "embed"
+	"fmt"
+	"os"
+	"strings"
 
-// Rate is a model's input/output price in USD per 1M tokens.
+	"gopkg.in/yaml.v3"
+)
+
+//go:embed prices.yaml
+var embeddedPrices []byte
+
+// Rate is a model's input/output price in USD per 1M tokens. YAML
+// field names match the documented operator-facing schema.
 type Rate struct {
-	InputUSDPerMTok  float64
-	OutputUSDPerMTok float64
+	InputUSDPerMTok  float64 `yaml:"input_usd_per_mtok"`
+	OutputUSDPerMTok float64 `yaml:"output_usd_per_mtok"`
 }
 
-// Cost returns the USD cost for the given token usage. ok is false if no
-// price exists for (system, model); callers should skip cost emission.
-func Cost(system, model string, inputTokens, outputTokens int64) (usd float64, ok bool) {
-	r, found := lookup(system, model)
+// Table is the active pricing catalogue. Construct via Default for the
+// embedded defaults, or via Load to merge an operator override on top.
+type Table struct {
+	// rates is keyed by gen_ai.system then by model-prefix.
+	rates map[string]map[string]Rate
+}
+
+// defaultTable is the embedded built-in catalogue. It is constructed
+// once at package init and never mutated, so concurrent readers of
+// Default() are safe.
+var defaultTable *Table
+
+func init() {
+	var parsed map[string]map[string]Rate
+	if err := yaml.Unmarshal(embeddedPrices, &parsed); err != nil {
+		panic(fmt.Errorf("pricing: embedded prices.yaml malformed: %w", err))
+	}
+	defaultTable = &Table{rates: parsed}
+}
+
+// Default returns the embedded built-in pricing catalogue. The returned
+// table is shared — do not mutate it.
+func Default() *Table {
+	return defaultTable
+}
+
+// Load builds a Table that layers an operator-supplied YAML override
+// on top of the built-in catalogue. Empty path returns Default().
+//
+// failOpen controls behaviour when the file is missing or malformed:
+//   - false (recommended for production): return an error so the
+//     operator notices.
+//   - true: silently fall back to Default() so a typo'd path doesn't
+//     crash the proxy.
+func Load(path string, failOpen bool) (*Table, error) {
+	if path == "" {
+		return Default(), nil
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // operator supplies the path
+	if err != nil {
+		if failOpen {
+			return Default(), nil
+		}
+		return nil, fmt.Errorf("read pricing file %q: %w", path, err)
+	}
+	var override map[string]map[string]Rate
+	if err := yaml.Unmarshal(raw, &override); err != nil {
+		if failOpen {
+			return Default(), nil
+		}
+		return nil, fmt.Errorf("parse pricing file %q: %w", path, err)
+	}
+
+	// Merge: deep-copy the defaults, then layer the override per
+	// (system, model-prefix) key. The override wins per matching key
+	// without dropping any unspecified default.
+	merged := make(map[string]map[string]Rate, len(defaultTable.rates))
+	for sys, models := range defaultTable.rates {
+		clone := make(map[string]Rate, len(models))
+		for k, v := range models {
+			clone[k] = v
+		}
+		merged[sys] = clone
+	}
+	for sys, models := range override {
+		if merged[sys] == nil {
+			merged[sys] = make(map[string]Rate, len(models))
+		}
+		for k, v := range models {
+			merged[sys][k] = v
+		}
+	}
+	return &Table{rates: merged}, nil
+}
+
+// Cost returns the USD cost for the given token usage against this
+// table. ok is false if no rate exists for (system, model); callers
+// should skip cost emission in that case.
+func (t *Table) Cost(system, model string, inputTokens, outputTokens int64) (usd float64, ok bool) {
+	r, found := t.lookup(system, model)
 	if !found {
 		return 0, false
 	}
@@ -25,10 +117,8 @@ func Cost(system, model string, inputTokens, outputTokens int64) (usd float64, o
 	return usd, true
 }
 
-// lookup matches longest model-prefix first so that snapshot-pinned model IDs
-// (e.g. "gpt-4o-mini-2024-07-18") inherit their family's price.
-func lookup(system, model string) (Rate, bool) {
-	table, ok := tables[system]
+func (t *Table) lookup(system, model string) (Rate, bool) {
+	table, ok := t.rates[system]
 	if !ok {
 		return Rate{}, false
 	}
@@ -49,30 +139,9 @@ func lookup(system, model string) (Rate, bool) {
 	return bestRate, bestLen >= 0
 }
 
-// tables holds the built-in price catalogue. Values are the public list price
-// at time of release; production deployments should override per their
-// negotiated rate. Source: provider pricing pages, snapshot 2025-Q4.
-var tables = map[string]map[string]Rate{
-	"openai": {
-		"gpt-4o-mini":   {InputUSDPerMTok: 0.150, OutputUSDPerMTok: 0.600},
-		"gpt-4o":        {InputUSDPerMTok: 2.500, OutputUSDPerMTok: 10.000},
-		"gpt-4-turbo":   {InputUSDPerMTok: 10.000, OutputUSDPerMTok: 30.000},
-		"gpt-4":         {InputUSDPerMTok: 30.000, OutputUSDPerMTok: 60.000},
-		"gpt-3.5-turbo": {InputUSDPerMTok: 0.500, OutputUSDPerMTok: 1.500},
-		"o1-mini":       {InputUSDPerMTok: 3.000, OutputUSDPerMTok: 12.000},
-		"o1-preview":    {InputUSDPerMTok: 15.000, OutputUSDPerMTok: 60.000},
-		"o1":            {InputUSDPerMTok: 15.000, OutputUSDPerMTok: 60.000},
-		"o3-mini":       {InputUSDPerMTok: 1.100, OutputUSDPerMTok: 4.400},
-		// Embedding models price per input only; output is conventionally 0.
-		"text-embedding-3-small": {InputUSDPerMTok: 0.020},
-		"text-embedding-3-large": {InputUSDPerMTok: 0.130},
-		"text-embedding-ada-002": {InputUSDPerMTok: 0.100},
-	},
-	"anthropic": {
-		"claude-3-5-haiku":  {InputUSDPerMTok: 0.800, OutputUSDPerMTok: 4.000},
-		"claude-3-5-sonnet": {InputUSDPerMTok: 3.000, OutputUSDPerMTok: 15.000},
-		"claude-3-opus":     {InputUSDPerMTok: 15.000, OutputUSDPerMTok: 75.000},
-		"claude-3-sonnet":   {InputUSDPerMTok: 3.000, OutputUSDPerMTok: 15.000},
-		"claude-3-haiku":    {InputUSDPerMTok: 0.250, OutputUSDPerMTok: 1.250},
-	},
+// Cost is a backwards-compatible package-level alias that resolves
+// against the embedded built-in table. Code paths that need an
+// operator-overridable table should hold a *Table directly.
+func Cost(system, model string, inputTokens, outputTokens int64) (usd float64, ok bool) {
+	return defaultTable.Cost(system, model, inputTokens, outputTokens)
 }

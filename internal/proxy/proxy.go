@@ -74,6 +74,11 @@ type Handler struct {
 	// values on the metric path. Span attributes keep the raw model
 	// string — span cardinality is governed by retention.
 	modelLabel *labels.ModelLabel
+
+	// pricing is the active cost catalogue (built-in defaults, optionally
+	// overlaid with an operator file). Held per-Handler so
+	// `cfg.Pricing.Path` actually changes the recorded cost.
+	pricing *pricing.Table
 }
 
 // New builds a Handler from validated config and a Providers bundle. It
@@ -136,6 +141,11 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 		return nil, fmt.Errorf("requests counter: %w", err)
 	}
 
+	priceTable, err := pricing.Load(cfg.Pricing.Path, cfg.Pricing.FailOpen)
+	if err != nil {
+		return nil, fmt.Errorf("pricing: %w", err)
+	}
+
 	return &Handler{
 		cfg:        cfg,
 		providers:  providers,
@@ -146,6 +156,7 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 		requests:   reqs,
 		logger:     logger,
 		modelLabel: labels.NewModelLabel(labels.DefaultMaxCardinality),
+		pricing:    priceTable,
 	}, nil
 }
 
@@ -291,7 +302,7 @@ func (h *Handler) responseInterceptor(
 		if model == "" {
 			model = info.RequestModel
 		}
-		if usd, ok := pricing.Cost(info.System, model, info.InputTokens, info.OutputTokens); ok {
+		if usd, ok := h.pricing.Cost(info.System, model, info.InputTokens, info.OutputTokens); ok {
 			h.meters.CostUSD.Add(ctx, usd, metric.WithAttributes(
 				attribute.String(genai.AttrSystem, info.System),
 				attribute.String(genai.AttrRequestModel, reqModelLabel),

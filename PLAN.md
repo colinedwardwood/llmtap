@@ -933,11 +933,31 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
     seen by upstream does not carry the client's `Accept-Encoding`
     verbatim.
 
-- [ ] **A7 — Pricing table cannot be overridden (item 0.5)** 🔴
+- [x] **A7 — Pricing table cannot be overridden (item 0.5)** 🔴
   **Finding:** README claims operators can override negotiated rates;
   no config knob exists. Every production cost number is the wrong
   number.
-  **Fix:** `pricing.path` config + embedded YAML as default.
+  **Fix:** Moved the in-Go `tables` map to `internal/pricing/prices.yaml`
+  and embedded via `//go:embed`. New `pricing.Table` type with
+  `Default()` + `Load(path, failOpen)` factories: the override file is
+  merged on top of the built-in catalogue per (system, model-prefix)
+  key, so unspecified models retain the default rate. Added
+  `config.Pricing{Path, FailOpen}` and threaded a per-Handler
+  `*pricing.Table` through `proxy.New`; the recordMetrics call site
+  uses `h.pricing.Cost(...)` instead of the package-level function.
+  **Evidence:**
+  - Unit tests cover the seven scenarios: default loads, override
+    replaces, override falls back per-key, fail-closed errors on
+    missing/malformed, fail-open silently degrades, empty path
+    returns default.
+  - `TestProxyEmitsOverriddenCost` (proxy integration): a config with
+    `Pricing.Path` pointing at a YAML setting `gpt-4o-mini` to
+    0.99 USD/Mtok records `gen_ai.cost.usd = 0.99` on the span,
+    not the built-in 0.15.
+  - `TestProxyNewFailsOnMissingPricingFileFailClosed`: `proxy.New`
+    refuses to construct when `pricing.path` is misconfigured and
+    `fail_open=false`.
+  - `config.example.yaml` documents the new `pricing:` section.
 
 - [ ] **A8 — `--log-level` is a no-op (item 0.8)** 🔴
   **Finding:** `slog.SetLogLoggerLevel` does not affect the otelslog

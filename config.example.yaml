@@ -69,6 +69,21 @@ http:
 request:
   max_body_bytes: 33554432   # 32 MiB
 
+# Cost catalogue override. Built-in prices ship with llmtap (see
+# internal/pricing/prices.yaml for the embedded snapshot). Production
+# deployments should point `path` at a YAML file with the same shape
+# to record negotiated rates instead of public list price. The file
+# is merged on top of the built-ins, so unspecified models keep their
+# default rate.
+#
+# `fail_open: false` is recommended for production — a missing or
+# malformed file fails the proxy at startup so operators notice.
+# `fail_open: true` swallows the error and falls back to the
+# built-in catalogue.
+pricing:
+  path: ""           # e.g. /etc/llmtap/prices.yaml
+  fail_open: false
+
 service:
   name: llmtap
   namespace: observability
