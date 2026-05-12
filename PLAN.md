@@ -883,12 +883,23 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
     project's history — the previously-documented bug-marker failure
     is gone.
 
-- [ ] **A4 — 4xx body truncated to client (item 0.2)** 🔴
+- [x] **A4 — 4xx body truncated to client (item 0.2)** 🔴
   **Finding:** Error responses are replaced with a 64 KiB snippet
   buffer; clients debugging upstream errors get a truncated body they
   cannot deserialize.
-  **Fix:** Use a side buffer for the span attribute; restore the
-  original body to the client.
+  **Fix:** New `snippetCapture` type implements `io.Writer` and is
+  hooked into `resp.Body` via `io.TeeReader`. The body itself flows
+  through the tee untouched to the client; the side capture records
+  the first 1024 bytes (for `http.response.body_snippet`) and the
+  total size (for `http.response.body_size`). Span attributes are
+  attached in `finishSpan` after the tee has drained.
+  **Evidence:**
+  - `TestProxyForwardsLarge4xxIntact`: upstream sends 200 KiB error
+    body; client receives all 200 KiB; span's `body_size` is 204800
+    and `body_snippet` is the bounded prefix.
+  - Existing A2 tests (`TestErrorBodySnippetSuppressedWhenContentOff`,
+    `TestErrorBodySnippetAttachedWhenContentEvents`,
+    `TestErrorBodySizeAttachedAlways`) all stay green.
 
 - [ ] **A5 — Streaming metrics lose trace context (item 0.3)** 🔴
   **Finding:** Streaming `finalize` is invoked with

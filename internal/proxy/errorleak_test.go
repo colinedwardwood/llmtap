@@ -143,6 +143,79 @@ func TestErrorBodySnippetAttachedWhenContentEvents(t *testing.T) {
 	}
 }
 
+// TestProxyForwardsLarge4xxIntact is the regression test for A4: the
+// proxy must forward an upstream error body byte-for-byte to the
+// client, regardless of how large it is. Previously the body was
+// silently truncated at 64 KiB (the snippet-capture limit) and the
+// client received only the prefix.
+func TestProxyForwardsLarge4xxIntact(t *testing.T) {
+	t.Parallel()
+
+	// 200 KiB > old 64 KiB cap.
+	bodyText := strings.Repeat("E", 200*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, bodyText)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Default()
+	cfg.Content.Mode = config.CaptureEvents
+	cfg.Upstreams = []config.Upstream{{
+		Name: "openai", Prefix: "/v1", Target: upstream.URL, Provider: "openai",
+	}}
+	prov, rec, _ := realMeterProviders(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h, err := proxy.New(cfg, provider.BuiltIn(), prov, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		bytes.NewReader([]byte(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if len(got) != len(bodyText) {
+		t.Fatalf("client received %d bytes; upstream sent %d", len(got), len(bodyText))
+	}
+
+	// Span must have body_snippet of <= 1024 bytes (still a snippet, not
+	// the whole body) AND body_size equal to the full upstream size.
+	var snippet string
+	var size int64 = -1
+	for _, s := range rec.Ended() {
+		for _, a := range s.Attributes() {
+			switch string(a.Key) {
+			case "http.response.body_snippet":
+				snippet = a.Value.AsString()
+			case "http.response.body_size":
+				size = a.Value.AsInt64()
+			}
+		}
+	}
+	if snippet == "" {
+		t.Fatal("body_snippet not attached")
+	}
+	// Snippet is a UTF-8-clean prefix of the body, ≤ 1024 bytes after
+	// truncateUTF8 (which may shave a few bytes off the end so a multi-
+	// byte rune isn't split, plus the "…" ellipsis when it does truncate).
+	if len(snippet) > 1100 {
+		t.Errorf("snippet length = %d, want ≤ ~1024", len(snippet))
+	}
+	if size != int64(len(bodyText)) {
+		t.Errorf("body_size = %d, want %d", size, len(bodyText))
+	}
+}
+
 // TestErrorBodySizeAttachedAlways asserts size metadata (byte count, no
 // content) is attached on every 4xx regardless of content.mode, so
 // operators have at least a visibility hint that an error body was

@@ -219,8 +219,12 @@ func (h *Handler) responseInterceptor(
 	upstreamName string,
 ) (finalize func(context.Context), modify modifyFn) {
 	var (
-		finalized atomic.Bool
+		finalized  atomic.Bool
 		statusCode int
+		// errCapture, when non-nil, indicates the response was an error
+		// (4xx/5xx). It tees a snippet from the body without buffering
+		// the whole thing so the original stream forwards intact.
+		errCapture *snippetCapture
 	)
 
 	finishSpan := func() {
@@ -230,6 +234,15 @@ func (h *Handler) responseInterceptor(
 			span.SetStatus(codes.Ok, "")
 		}
 		span.SetAttributes(attribute.Int("http.response.status_code", statusCode))
+		if errCapture != nil {
+			span.SetAttributes(attribute.Int("http.response.body_size", errCapture.total))
+			if captureContent {
+				span.SetAttributes(attribute.String(
+					"http.response.body_snippet",
+					truncateUTF8(string(errCapture.head), 1024),
+				))
+			}
+		}
 		span.End()
 	}
 
@@ -300,24 +313,22 @@ func (h *Handler) responseInterceptor(
 		span.SetAttributes(attribute.String(genai.AttrSystem, info.System))
 
 		if statusCode >= 400 {
-			// Error bodies are small and useful, but their content is
-			// load-bearing for the privacy contract: OpenAI's auth
-			// failures echo a prefix of the offending API key, and
-			// upstream error messages routinely contain account
-			// identifiers. Attach byte-size metadata always, but only
-			// attach the body content as a span attribute when the
-			// operator has explicitly opted into content capture.
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-			_ = resp.Body.Close()
-			if err == nil {
-				span.SetAttributes(attribute.Int("http.response.body_size", len(body)))
-				if captureContent {
-					span.SetAttributes(attribute.String("http.response.body_snippet", truncateUTF8(string(body), 1024)))
-				}
-				resp.Body = io.NopCloser(bytes.NewReader(body))
-				resp.ContentLength = int64(len(body))
-			} else {
-				resp.Body = http.NoBody
+			// Error bodies must reach the client byte-for-byte — they
+			// frequently carry the structured detail the caller needs
+			// to debug. We peel off a bounded snippet for the span via
+			// an io.TeeReader; the rest of the bytes flow through
+			// untouched. The snippet itself is gated on captureContent
+			// since OpenAI/Anthropic error bodies routinely echo a
+			// prefix of the offending API key, which would otherwise
+			// leak into traces under the privacy-off default.
+			errCapture = &snippetCapture{headCap: 1024}
+			origCloser := resp.Body
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{
+				Reader: io.TeeReader(resp.Body, errCapture),
+				Closer: origCloser,
 			}
 			return nil
 		}
@@ -354,6 +365,29 @@ func (h *Handler) responseInterceptor(
 // errBodyTooLarge signals that an inbound request body exceeds the
 // configured hard cap. Callers translate this to an HTTP 413.
 var errBodyTooLarge = errors.New("request body exceeds maximum")
+
+// snippetCapture is an io.Writer used as the side of an io.TeeReader.
+// It records the first headCap bytes of what's written (for span
+// attribute attachment) and counts the total bytes seen (for size
+// telemetry). Subsequent writes past headCap silently advance only the
+// counter — the response body itself flows through the tee unchanged.
+type snippetCapture struct {
+	head    []byte
+	headCap int
+	total   int
+}
+
+func (s *snippetCapture) Write(p []byte) (int, error) {
+	s.total += len(p)
+	if remaining := s.headCap - len(s.head); remaining > 0 {
+		take := len(p)
+		if take > remaining {
+			take = remaining
+		}
+		s.head = append(s.head, p[:take]...)
+	}
+	return len(p), nil
+}
 
 // captureHeadAndForward buffers up to maxEnrichmentBodyBytes of r.Body
 // for parser-driven enrichment, then reconstitutes r.Body so the proxy
