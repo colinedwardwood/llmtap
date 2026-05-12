@@ -26,8 +26,9 @@ import (
 // MeterProvider so the test can introspect every label set actually
 // recorded into metrics. The fakeProviders helper used by other tests
 // uses noop meters, which is fine for span assertions but useless for
-// cardinality assertions.
-func realMeterProviders(t *testing.T) (telemetry.Providers, *sdkmetric.ManualReader) {
+// cardinality assertions. Returns the SpanRecorder too so a single
+// helper covers both metric- and span-based assertions.
+func realMeterProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecorder, *sdkmetric.ManualReader) {
 	t.Helper()
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
@@ -62,7 +63,7 @@ func realMeterProviders(t *testing.T) (telemetry.Providers, *sdkmetric.ManualRea
 			CostUSD:           cost,
 		},
 		Shutdown: func(context.Context) error { return nil },
-	}, reader
+	}, rec, reader
 }
 
 // TestProxyMetricsModelCardinalityIsBounded fires far more distinct model
@@ -91,7 +92,7 @@ func TestProxyMetricsModelCardinalityIsBounded(t *testing.T) {
 	cfg.Upstreams = []config.Upstream{{
 		Name: "openai", Prefix: "/v1", Target: upstream.URL, Provider: "openai",
 	}}
-	prov, reader := realMeterProviders(t)
+	prov, _, reader := realMeterProviders(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h, err := proxy.New(cfg, provider.BuiltIn(), prov, logger)
 	if err != nil {

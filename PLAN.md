@@ -818,13 +818,41 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   `_other`. Unit tests cover normalization, lowercasing, empty input,
   cap engagement, and `-race` concurrency safety.
 
-- [ ] **A2 — Error body snippet leaks API key prefix (item 0.9)** 🔴
+- [x] **A2 — Error body snippet leaks API key prefix (item 0.9)** 🔴
   **Finding:** On every 4xx/5xx, `http.response.body_snippet` (first
   1024 UTF-8 bytes) is attached to the span regardless of
   `content.mode: off`. OpenAI auth failures echo the offending API
   key prefix. Token exposure in traces.
-  **Fix:** Gate snippet capture on `content.mode != off`; attach only
-  size + machine-readable error class when off.
+  **Fix:** Gate `body_snippet` attachment on `captureContent`. Attach
+  `http.response.body_size` (an integer, never content) unconditionally
+  so operators still see that an error body was observed.
+  **Root cause uncovered during this fix:** the `modify` callback in
+  `proxy.responseInterceptor` was *never being invoked at all* for any
+  response. The ReverseProxy's `ModifyResponse` hook retrieves the
+  function from the request context via `.(modifyFn)`, but the value
+  was stored with the unnamed type `func(*http.Response) error`. Go
+  type assertions distinguish named types from their underlying
+  unnamed types, so the assertion silently failed on every request
+  since project inception. This means every existing response-side
+  enrichment (`http.response.status_code`, span status, streaming
+  TTFT, output token usage, finish reasons, cost, the body snippet
+  itself) has been silently absent in production. The pre-existing
+  `TestProxyEndToEndStreaming` only asserted `value != 2` rather than
+  `value == 2`, vacuously passing despite the silent break.
+  **Fix (root cause):** Changed `responseInterceptor`'s return type
+  from `func(*http.Response) error` to the named `modifyFn`. The
+  context assertion now succeeds; `modify` runs on every response.
+  **Evidence:**
+  - `TestErrorBodySnippetSuppressedWhenContentOff` — leaked secret
+    not present on any span attribute when `content.mode=off`, while
+    the client still receives the upstream body verbatim.
+  - `TestErrorBodySnippetAttachedWhenContentEvents` — snippet IS
+    attached when the operator opts into events; proves the path
+    works when intended.
+  - `TestErrorBodySizeAttachedAlways` — byte-count metadata flows
+    independent of content mode.
+  - Span status now correctly reports `Error HTTP 400` and
+    `http.response.status_code = 400` (previously 0).
 
 ## High (data loss / DoS / auth boundary / cost misreporting)
 

@@ -196,14 +196,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // responseInterceptor returns:
 //   - finalize: must be called once after ServeHTTP returns. It records
 //     metrics and ends the span if the streaming wrapper hasn't already.
-//   - modify: the ReverseProxy.ModifyResponse hook.
+//   - modify: the ReverseProxy.ModifyResponse hook. Typed as modifyFn so
+//     the context-value type assertion in the Rewrite hook succeeds —
+//     named function types and their unnamed underlying type are
+//     distinct under runtime type assertions.
 func (h *Handler) responseInterceptor(
 	prv provider.Provider,
 	info *provider.Info,
 	captureContent bool,
 	span trace.Span,
 	upstreamName string,
-) (finalize func(context.Context), modify func(*http.Response) error) {
+) (finalize func(context.Context), modify modifyFn) {
 	var (
 		finalized atomic.Bool
 		statusCode int
@@ -286,12 +289,20 @@ func (h *Handler) responseInterceptor(
 		span.SetAttributes(attribute.String(genai.AttrSystem, info.System))
 
 		if statusCode >= 400 {
-			// Error bodies are small and useful: read for the upstream
-			// error code, restore the body, and let finalize record.
+			// Error bodies are small and useful, but their content is
+			// load-bearing for the privacy contract: OpenAI's auth
+			// failures echo a prefix of the offending API key, and
+			// upstream error messages routinely contain account
+			// identifiers. Attach byte-size metadata always, but only
+			// attach the body content as a span attribute when the
+			// operator has explicitly opted into content capture.
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 			_ = resp.Body.Close()
 			if err == nil {
-				span.SetAttributes(attribute.String("http.response.body_snippet", truncateUTF8(string(body), 1024)))
+				span.SetAttributes(attribute.Int("http.response.body_size", len(body)))
+				if captureContent {
+					span.SetAttributes(attribute.String("http.response.body_snippet", truncateUTF8(string(body), 1024)))
+				}
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 			} else {
