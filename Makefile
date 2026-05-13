@@ -18,7 +18,7 @@ GO       ?= go
 GOFLAGS  ?= -trimpath
 TESTOPTS ?= -race -count=1 -timeout=60s
 
-.PHONY: all build run test lint vet tidy fmt clean docker docker-build docker-push compose-up compose-up-insecure compose-down release
+.PHONY: all build run test load-test lint vet tidy fmt clean docker docker-build docker-push compose-up compose-up-insecure compose-down release
 
 all: lint test build
 
@@ -30,6 +30,12 @@ run: build
 
 test:
 	$(GO) test $(TESTOPTS) ./...
+
+# Go-native load harness. Asserts p99 added latency < 5ms, zero 5xx,
+# no goroutine leak. Override via LOAD_RPS / LOAD_DURATION /
+# LOAD_P99_BUDGET — see test/load/load_test.go.
+load-test:
+	$(GO) test -count=1 -timeout=2m ./test/load/...
 
 vet:
 	$(GO) vet ./...

@@ -86,6 +86,26 @@ jobs:
           exit-code: "1"
           ignore-unfixed: true
 
+  load:
+    name: load test (p99 added latency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: make load-test
+        # Slightly relaxed budget on the shared GitHub runner —
+        # virtualization noise pushes p99 above the 5ms local
+        # default. The point is regression detection vs the trend,
+        # not a hard SLO.
+        env:
+          LOAD_RPS: "200"
+          LOAD_DURATION: "10s"
+          LOAD_P99_BUDGET: "15ms"
+        run: make load-test
+
   build:
     name: build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
