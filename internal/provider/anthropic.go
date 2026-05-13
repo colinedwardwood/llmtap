@@ -12,6 +12,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// path matching helpers (pathSegments, isAPIParent, isVersionSegment) live
+// in openai.go — same package, shared semantics across providers.
+
 // Anthropic parses the Messages API ("/v1/messages"). Anthropic streams as
 // named SSE events (message_start, content_block_delta, message_delta,
 // message_stop) which is more structured than OpenAI; we exploit that to
@@ -20,9 +23,16 @@ type Anthropic struct{}
 
 func (Anthropic) System() string { return genai.SystemAnthropic }
 
+// OperationFor recognizes the Anthropic Messages API. Match is
+// strict-by-segment to avoid suffix collisions: /v1/anthropic/.well-known/messages
+// is NOT a Messages call even though it ends in `/messages`. The
+// accepted shape is `(prefix...)/v\d+/messages`.
 func (Anthropic) OperationFor(urlPath string) string {
-	if strings.HasSuffix(urlPath, "/messages") {
-		return genai.OpChat
+	segs := pathSegments(urlPath)
+	if n := len(segs); n >= 2 && segs[n-1] == "messages" {
+		if isAPIParent(segs[:n-1]) {
+			return genai.OpChat
+		}
 	}
 	return ""
 }
@@ -171,9 +181,15 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicDelta struct {
-	Type       string `json:"type,omitempty"`
-	Text       string `json:"text,omitempty"`
-	StopReason string `json:"stop_reason,omitempty"`
+	Type string `json:"type,omitempty"`
+	Text string `json:"text,omitempty"`
+	// PartialJSON carries one chunk of a streaming tool_use block's
+	// `input` JSON. Anthropic emits these via content_block_delta with
+	// type=input_json_delta when the model is calling a tool. We don't
+	// reassemble the arguments — only the *presence* of a delta is
+	// needed to fire TTFT and prove the stream is producing output.
+	PartialJSON string `json:"partial_json,omitempty"`
+	StopReason  string `json:"stop_reason,omitempty"`
 }
 
 func (Anthropic) WrapStream(
@@ -211,14 +227,35 @@ func (Anthropic) WrapStream(
 				}
 			}
 		case "content_block_delta":
-			if ev.Delta != nil && ev.Delta.Text != "" {
-				if !gotFirst {
-					gotFirst = true
-					info.FirstTokenAt = time.Now()
-					onFirstToken()
-				}
-				if content.Capture {
-					assembled.WriteString(ev.Delta.Text)
+			// Anthropic content_block_delta carries either a text_delta
+			// (model is producing a text block) or an input_json_delta
+			// (model is producing a tool_use block's arguments JSON).
+			// Both shapes prove the upstream is generating tokens, so
+			// both trigger TTFT — without this, every tool-only stream
+			// records FirstTokenAt=0.
+			if ev.Delta != nil {
+				switch ev.Delta.Type {
+				case "text_delta":
+					if ev.Delta.Text != "" {
+						if !gotFirst {
+							gotFirst = true
+							info.FirstTokenAt = time.Now()
+							onFirstToken()
+						}
+						if content.Capture {
+							assembled.WriteString(ev.Delta.Text)
+						}
+					}
+				case "input_json_delta":
+					if !gotFirst {
+						gotFirst = true
+						info.FirstTokenAt = time.Now()
+						onFirstToken()
+					}
+					// Tool-argument JSON fragments are intentionally not
+					// assembled — they belong to a tool_use block, not
+					// to assistant text, and concatenating them onto the
+					// transcript would produce garbage.
 				}
 			}
 		case "message_delta":

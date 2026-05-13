@@ -132,6 +132,110 @@ func TestSSETeeResumesParsingAfterOverflow(t *testing.T) {
 	}
 }
 
+// TestSSETeeFramingCRLF is the A21 regression. The SSE spec (HTML5
+// §EventSource) allows `\n\n`, `\r\n\r\n`, or `\r\r` as a frame
+// terminator. Today only `\n\n` is recognized; if OpenAI or Anthropic
+// switch to CRLF framing (or proxy via a CRLF-rewriting intermediary)
+// llmtap silently degrades to "no events ever parsed."
+func TestSSETeeFramingCRLF(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Join([]string{
+		"event: message_start",
+		`data: {"id":"a"}`,
+		"",
+		"event: content_block_delta",
+		`data: {"text":"hello"}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\r\n")
+
+	src := io.NopCloser(strings.NewReader(body))
+	var got []captured
+	tee := newSSETee(src,
+		func(event string, data []byte) {
+			got = append(got, captured{event: event, data: string(data)})
+		},
+		nil, func() {},
+	)
+	if _, err := io.ReadAll(tee); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("CRLF framing produced %d events, want 3: %+v", len(got), got)
+	}
+	if got[0].event != "message_start" || !strings.Contains(got[0].data, `"id":"a"`) {
+		t.Errorf("first event = %+v", got[0])
+	}
+	if got[1].event != "content_block_delta" || !strings.Contains(got[1].data, "hello") {
+		t.Errorf("second event = %+v", got[1])
+	}
+	if got[2].data != "[DONE]" {
+		t.Errorf("done sentinel = %q", got[2].data)
+	}
+}
+
+// TestSSETeeFramingCR covers the legacy `\r\r` terminator (HTML5 also
+// permits this for ancient Mac-line-ending content).
+func TestSSETeeFramingCR(t *testing.T) {
+	t.Parallel()
+
+	body := "event: ping\rdata: one\r\rdata: two\r\r"
+	src := io.NopCloser(strings.NewReader(body))
+	var got []captured
+	tee := newSSETee(src,
+		func(event string, data []byte) {
+			got = append(got, captured{event: event, data: string(data)})
+		},
+		nil, func() {},
+	)
+	if _, err := io.ReadAll(tee); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("CR framing produced %d events, want 2: %+v", len(got), got)
+	}
+	if got[0].event != "ping" || got[0].data != "one" {
+		t.Errorf("first event = %+v", got[0])
+	}
+	if got[1].data != "two" {
+		t.Errorf("second event = %+v", got[1])
+	}
+}
+
+// TestSSETeeFramingMixed covers a stream that interleaves LF, CRLF,
+// and CR terminators — e.g. an upstream + an intermediary disagreeing
+// on line endings. Each event should still dispatch at its boundary.
+func TestSSETeeFramingMixed(t *testing.T) {
+	t.Parallel()
+
+	// Frame 1: LF-LF. Frame 2: CRLF-CRLF. Frame 3: CR-CR.
+	body := "data: one\n\n" +
+		"data: two\r\n\r\n" +
+		"data: three\r\r"
+	src := io.NopCloser(strings.NewReader(body))
+	var got []captured
+	tee := newSSETee(src,
+		func(event string, data []byte) {
+			got = append(got, captured{event: event, data: string(data)})
+		},
+		nil, func() {},
+	)
+	if _, err := io.ReadAll(tee); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("mixed framing produced %d events, want 3: %+v", len(got), got)
+	}
+	want := []string{"one", "two", "three"}
+	for i, w := range want {
+		if got[i].data != w {
+			t.Errorf("event %d data = %q, want %q", i, got[i].data, w)
+		}
+	}
+}
+
 func TestSSETeeFlushesTrailingPartial(t *testing.T) {
 	t.Parallel()
 
