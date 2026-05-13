@@ -32,15 +32,35 @@ upstreams:
     provider: openai
     # max_in_flight: 256          # cap concurrent forwarded requests;
                                   # over-cap = 429 + Retry-After: 1.
-                                  # Pairs with a circuit breaker (later)
-                                  # so an upstream brownout can't melt
-                                  # the proxy. 0 (default) = unlimited.
+                                  # Pairs with the circuit breaker
+                                  # below so an upstream brownout
+                                  # can't melt the proxy. 0 (default)
+                                  # = unlimited.
+    # pin_sha256:                 # Optional upstream certificate
+    #   - 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd  # SPKI sha256, hex (32B/64 chars).
+    #                             # Each entry must match the leaf
+    #                             # SPKI sha256 of an upstream cert
+    #                             # currently in rotation. Stdlib
+    #                             # chain verification still runs;
+    #                             # this is the additional pin layer.
+    # breaker:                    # Per-upstream circuit breaker.
+    #   failures: 5               # trip after N consecutive 5xx.
+    #                             # 0 (default) disables the breaker.
+    #   window: 30s               # consecutive count resets if no
+    #                             # failure within window. 0 = no
+    #                             # time bound on the run.
+    #   recovery_window: 15s      # breaker stays open this long
+    #                             # before admitting one probe.
 
   - name: anthropic
     prefix: /anthropic
     target: https://api.anthropic.com
     provider: anthropic
     # max_in_flight: 256
+    # pin_sha256: []
+    # breaker:
+    #   failures: 5
+    #   recovery_window: 15s
 
 # OpenTelemetry export. Endpoint format depends on protocol:
 #   grpc: "host:4317"        (no scheme)

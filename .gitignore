@@ -25,3 +25,4 @@ deploy/compose/data/
 
 # Local agent / Claude Code harness state
 .claude/
+.worktrees/

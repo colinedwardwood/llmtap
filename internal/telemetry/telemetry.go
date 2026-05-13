@@ -44,6 +44,14 @@ type Providers struct {
 	Logger   otellog.Logger
 	Meters   GenAIMeters
 	Shutdown func(context.Context) error
+	// Ready reports whether the telemetry pipeline is ready to serve
+	// traffic. The /readyz endpoint surfaces this. A nil Ready is
+	// treated as "always ready" by the proxy. The current
+	// implementation sets this to a constant `true` after Setup
+	// returns successfully — i.e. all three providers (trace, meter,
+	// log) constructed without error. A stricter signal that waits
+	// for the first OTLP export round-trip is a separate item.
+	Ready func() bool
 }
 
 // GenAIMeters bundles the OTel GenAI instruments. Pre-creating them at
@@ -112,6 +120,11 @@ func Setup(ctx context.Context, cfg config.Config) (Providers, error) {
 		Logger:   logger,
 		Meters:   meters,
 		Shutdown: shutdown,
+		// Loose readiness signal: if Setup returned, the three
+		// providers exist and the global Otel handles are wired.
+		// A future revision can swap this for a callback that only
+		// flips true after the first OTLP export round-trip.
+		Ready: func() bool { return true },
 	}, nil
 }
 
