@@ -2,13 +2,15 @@
 
 Two adversarial reviews (2026-05-11) surfaced 29 numbered remediation
 items across Critical / High / Medium tiers. Eight additional Low-tier
-polish items followed. **All 37 items are closed as of v0.1.3.** This
-document is now a forward-looking ledger.
+polish items followed. A third adversarial review (2026-05-12) added
+ten more (C1–C10) targeting the auth gate, breaker bookkeeping, cert
+rotation, and provider/redaction coverage. **All 47 items are closed
+as of v0.1.4.** This document is now a forward-looking ledger.
 
 The per-commit audit trail lives in `git log`. Each remediation
-commit carries a `Closes A<n>` or `Closes L<n>` footer and an
-evidence block in the body — `git log -p <commit>` reads as the full
-remediation record.
+commit carries a `Closes A<n>` / `Closes L<n>` / `Closes C<n>` footer
+and an evidence block in the body — `git log -p <commit>` reads as
+the full remediation record.
 
 The README's "Roadmap" section is authoritative for what's next; this
 document just tracks what hasn't been started yet.
@@ -162,6 +164,30 @@ in v0.1.3. Each line lists the commit SHA where the fix landed;
 | L6  | O(K) byte-trie pricing lookup (168 ns/op at N=500) | `4d1c0ea` |
 | L7  | README honesty pass against post-A28 reality | `36c60a5` |
 | L8  | Go-native load test harness + CI gate | `7d5a633` |
+
+### Round 3 (round-3 adversarial review, 2026-05-12)
+
+The third pass focused on the auth gate (DoS amplification surface),
+breaker bookkeeping (probe-slot leak), cert rotation (torn-read),
+SSE overflow visibility, and gap-fill on the redaction catalogue.
+
+| Item | One-line | Commit |
+|---|---|---|
+| C1  | Release breaker probe slot on every passthrough exit | `7064fd4` |
+| C2  | Auth shape-check + 60s LRU cache before argon2 | `7064fd4` |
+| C3  | Loop-constant-time verifier across stored hashes | `7064fd4` |
+| C4  | Atomic cert+key load defeats torn-read at rotation | `1629b74` |
+| C5  | Extend default redaction to Google/Groq/Replicate/GitHub | `d76cd2f` |
+| C6  | SSE overflow as counter, not one-shot bool | `75f9430` |
+| C7  | `ServeHTTP` refactored into a flat pipeline | `7064fd4` |
+| C8  | `crypto/subtle.ConstantTimeCompare` for SPKI pin match | `7064fd4` |
+| C9  | NumCPU-bounded argon2 semaphore; 429 on overload | `7064fd4` |
+| C10 | Skip SNI ServerName for IP-literal upstreams | `7064fd4` |
+
+C1, C2, C3, C7, C8, C9, C10 co-committed because the `ServeHTTP`
+refactor (C7) is load-bearing on C1's single-release-point design and
+the auth verifier surface change (C2/C3/C9) cascades into proxy's
+admission gate. `git log -p 7064fd4` reads as the seven-item record.
 
 ### CI / release pipeline tail
 
