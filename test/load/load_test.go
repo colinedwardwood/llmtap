@@ -1,3 +1,5 @@
+//go:build loadtest
+
 // Package load is a Go-native load-test harness for llmtap. It fires a
 // configurable RPS at the proxy against an in-process fake upstream
 // and asserts:

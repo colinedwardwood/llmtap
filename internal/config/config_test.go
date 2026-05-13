@@ -85,9 +85,9 @@ func TestEnvOverridesOTLPHeaders(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	cases := map[string]string{
-		"Authorization":  "Bearer abc",
-		"X-Scope-OrgID":  "42",
-		"X-Tenant":       "acme",
+		"Authorization": "Bearer abc",
+		"X-Scope-OrgID": "42",
+		"X-Tenant":      "acme",
 	}
 	for k, want := range cases {
 		if got := cfg.Telemetry.Headers[k]; got != want {
@@ -107,9 +107,9 @@ func TestEnvOverridesSampleRatio(t *testing.T) {
 		{"0", 0},
 		{"0.25", 0.25},
 		{"1", 1},
-		{"1.5", 1},    // clamped down
-		{"-0.1", 0},   // clamped up
-		{"3", 1},      // clamped down
+		{"1.5", 1},  // clamped down
+		{"-0.1", 0}, // clamped up
+		{"3", 1},    // clamped down
 	}
 	for _, tc := range cases {
 		t.Run(tc.env, func(t *testing.T) {
