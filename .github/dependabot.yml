@@ -1,0 +1,61 @@
+# Dependabot keeps llmtap's transitive dependency tree current. llmtap
+# is the trust boundary that handles production API keys; we need to
+# pick up upstream CVE fixes the same week they ship.
+#
+# Two ecosystems matter:
+#   - gomod      : Go module deps (otel, x/crypto, grpc, yaml, …).
+#   - github-actions : pinned workflow actions (cosign-installer, syft,
+#                      slsa-github-generator, …).
+# Container base image (golang:1.26-alpine, distroless) updates are
+# tracked separately via the docker ecosystem.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    groups:
+      otel:
+        # The OTel module set must move as a coherent line. A
+        # mixed-version OTel install was the latent footgun A25
+        # closed; group all otel/* updates into one PR per cycle so
+        # the alignment stays intact.
+        patterns:
+          - "go.opentelemetry.io/*"
+      grpc-and-friends:
+        patterns:
+          - "google.golang.org/*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: "chore(docker)"
+      include: scope
