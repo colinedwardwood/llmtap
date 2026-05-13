@@ -141,3 +141,81 @@ func TestOpenAIWrapStreamFinishesOnce(t *testing.T) {
 		t.Errorf("finish reasons = %v", info.FinishReasons)
 	}
 }
+
+// TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken is the A26
+// regression for OpenAI. A streaming chat where the model decides to
+// emit a tool call rather than text never populates `delta.content`,
+// so the existing TTFT trigger (`delta.content != ""`) never fires.
+// Result: tool-only streams record FirstTokenAt = zero — every
+// downstream metric / span that depends on TTFT silently undercounts
+// real tool usage.
+//
+// The fix: fire on EITHER text content OR a non-empty tool_calls slice.
+func TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken(t *testing.T) {
+	t.Parallel()
+
+	// Mirror real OpenAI streaming: the model emits tool_calls deltas
+	// (no `content` at all), then a chunk with finish_reason=tool_calls.
+	chunks := []map[string]any{
+		{"id": "c", "model": "gpt-4o-mini", "choices": []any{
+			map[string]any{"index": 0, "delta": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index": 0, "id": "call_1", "type": "function",
+					"function": map[string]any{"name": "get_weather", "arguments": ""},
+				}},
+			}},
+		}},
+		{"id": "c", "model": "gpt-4o-mini", "choices": []any{
+			map[string]any{"index": 0, "delta": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index":    0,
+					"function": map[string]any{"arguments": `{"city":"`},
+				}},
+			}},
+		}},
+		{"id": "c", "model": "gpt-4o-mini", "choices": []any{
+			map[string]any{"index": 0, "delta": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index":    0,
+					"function": map[string]any{"arguments": `Paris"}`},
+				}},
+			}, "finish_reason": "tool_calls"},
+		}},
+	}
+
+	var b strings.Builder
+	for _, c := range chunks {
+		buf, _ := json.Marshal(c)
+		b.WriteString("data: ")
+		b.Write(buf)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("data: [DONE]\n\n")
+
+	_, tp := newRecorderTracer()
+	_, span := tp.Tracer("t").Start(context.Background(), "init")
+	info := &Info{System: "openai", Operation: "chat", RequestModel: "gpt-4o-mini"}
+
+	firstToken, done := 0, 0
+	stream := OpenAI{}.WrapStream(span, info, io.NopCloser(strings.NewReader(b.String())), ContentOpts{},
+		func() { firstToken++ },
+		func() { done++ },
+	)
+	if _, err := io.ReadAll(stream); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	_ = stream.Close()
+
+	if firstToken != 1 {
+		t.Errorf("firstToken called %d times, want exactly 1 on tool-only stream", firstToken)
+	}
+	if done != 1 {
+		t.Errorf("done called %d times, want exactly 1", done)
+	}
+	if info.FirstTokenAt.IsZero() {
+		t.Errorf("FirstTokenAt is zero on tool-only stream; TTFT metric is silently broken")
+	}
+	if len(info.FinishReasons) != 1 || info.FinishReasons[0] != "tool_calls" {
+		t.Errorf("finish reasons = %v, want [tool_calls]", info.FinishReasons)
+	}
+}

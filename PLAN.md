@@ -1215,12 +1215,63 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 - [ ] **A18 — Upstream cert pinning (item 1.2)** 🟡
 - [ ] **A19 — `/healthz` / `/readyz` endpoints (item 1.3)** 🟡
 - [ ] **A20 — Shutdown waits on active streams (item 1.4)** 🟡
-- [ ] **A21 — SSE `\r\n\r\n` / `\r\r` framing (item 1.11)** 🟡
-- [ ] **A22 — Strict operation-path matching (item 1.12)** 🟡
+- [x] **A21 — SSE `\r\n\r\n` / `\r\r` framing (item 1.11)** 🟡
+  **Evidence:** `sse.go` `drain` no longer hard-codes `\n\n`. New
+  `findFrameBoundary` scans for any of `\r\n\r\n`, `\n\n`, or `\r\r`
+  (the three terminators the HTML5 EventSource spec permits) and
+  returns the earliest match plus its byte length. `dispatch` likewise
+  replaces `bytes.Split(msg, "\n")` with a per-byte `splitSSELines`
+  helper so lines within a frame split on any of CR / LF / CRLF — a
+  CR-only payload no longer collapses into one unparseable line.
+  Three new sub-tests in `sse_test.go`: `TestSSETeeFramingCRLF` (a
+  full CRLF-framed stream parses every event), `TestSSETeeFramingCR`
+  (legacy `\r\r` framing dispatches at each boundary),
+  `TestSSETeeFramingMixed` (a single stream interleaving `\n\n`,
+  `\r\n\r\n`, and `\r\r` dispatches three distinct events). Before
+  the fix the CRLF case dispatched ONE event (one giant concatenated
+  blob); after, three events.
+
+- [x] **A22 — Strict operation-path matching (item 1.12)** 🟡
+  **Evidence:** `OperationFor` in both `openai.go` and `anthropic.go`
+  replaces `strings.HasSuffix` with segment-aware matching via a
+  new shared `pathSegments` / `isAPIParent` / `isVersionSegment`
+  helper trio. The rule: the segment immediately before the operation
+  must look like an API version (`v\d+`, case-insensitive) OR — for
+  the OpenAI Azure shape — follow a `deployments/{name}` pair. A
+  trailing-slash path is rejected up front (operations are exact
+  resources, not directories). New `operation_test.go` table-drives
+  both providers across 24 cases including the two PLAN-named
+  impostors (`/v1/files/chat/completions`,
+  `/v1/anthropic/.well-known/messages`) — both now return `""` while
+  legitimate paths (`/v1/chat/completions`, `/openai/v1/embeddings`,
+  `/openai/deployments/my-gpt-4o/chat/completions`,
+  `/v1/messages`) still map to their operations.
 - [ ] **A23 — Hot certificate reload (item 2.1)** 🟡
 - [ ] **A24 — Circuit breaker per upstream (item 2.2)** 🟡
 - [x] **A25 — OTel module version alignment (item 2.4)** 🟡 *(closed incidentally via A15 dep bumps to v1.43.0)*
-- [ ] **A26 — Tool-call streaming coverage (item 2.5)** 🟡
+- [x] **A26 — Tool-call streaming coverage (item 2.5)** 🟡
+  **Evidence:** Both `WrapStream` implementations now fire TTFT on
+  tool deltas, not just text deltas. OpenAI's `openAIMessage` gained
+  a `ToolCalls json.RawMessage` field (omitempty); the streaming
+  loop calls a new `hasToolCalls` helper alongside the existing
+  `delta.content` check. Tool-call argument fragments are NOT
+  concatenated into `assembled` — they belong to a separate logical
+  channel from assistant text. Anthropic's `anthropicDelta` gained
+  a `PartialJSON` field; the `content_block_delta` switch now
+  dispatches on `delta.Type` — `text_delta` keeps the existing
+  text-assembly behaviour, `input_json_delta` fires TTFT only.
+  Finish reasons (`tool_calls` for OpenAI, `tool_use` for
+  Anthropic) are recorded via the pre-existing finish-reason path,
+  unchanged. Two new tests:
+  `TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken` simulates a
+  three-chunk tool-call stream (no `content` field anywhere) and
+  asserts `info.FirstTokenAt` is non-zero AND finish reason is
+  `tool_calls`. `TestAnthropicWrapStreamToolOnlyStreamFiresFirstToken`
+  simulates the seven-event Anthropic tool-only shape (message_start
+  → content_block_start tool_use → input_json_delta × 2 →
+  content_block_stop → message_delta tool_use → message_stop) and
+  asserts FirstTokenAt is non-zero, finish reason is `tool_use`, and
+  output tokens flow through.
 - [ ] **A27 — Transport tuning per upstream (item 2.6)** 🟡
 - [ ] **A28 — Stream non-streaming JSON through (item 2.7)** 🟡
 - [ ] **A29 — Content-Length pre-check (item 2.8)** 🟡

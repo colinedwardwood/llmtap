@@ -3,6 +3,7 @@ package provider
 import (
 	"encoding/json"
 	"io"
+	"path"
 	"strings"
 	"time"
 
@@ -22,15 +23,97 @@ func (OpenAI) System() string { return genai.SystemOpenAI }
 // OperationFor returns "" for paths llmtap should pass through unenriched
 // (file uploads, fine-tuning, audio). v0.1 supports the two highest-volume
 // endpoints; more are a small additive change.
+//
+// Match is strict-by-segment, not suffix: /v1/files/chat/completions is a
+// real OpenAI sub-resource of the Files API, not a chat call, so it must
+// NOT be enriched as one. The accepted shapes:
+//
+//	(prefix...)/v\d+/chat/completions               — OpenAI / OpenAI-compat
+//	(prefix...)/v\d+/embeddings                     — OpenAI / OpenAI-compat
+//	(prefix...)/deployments/{name}/chat/completions — Azure OpenAI
+//	(prefix...)/deployments/{name}/embeddings       — Azure OpenAI
+//
+// `prefix` is any number of pass-through segments (tenant, region, etc.).
 func (OpenAI) OperationFor(urlPath string) string {
-	switch {
-	case strings.HasSuffix(urlPath, "/chat/completions"):
-		return genai.OpChat
-	case strings.HasSuffix(urlPath, "/embeddings"):
-		return genai.OpEmbeddings
-	default:
-		return ""
+	segs := pathSegments(urlPath)
+	// chat/completions: last two segments must be ["chat", "completions"].
+	if n := len(segs); n >= 3 && segs[n-1] == "completions" && segs[n-2] == "chat" {
+		if isAPIParent(segs[:n-2]) {
+			return genai.OpChat
+		}
 	}
+	// embeddings: last segment must be "embeddings".
+	if n := len(segs); n >= 2 && segs[n-1] == "embeddings" {
+		if isAPIParent(segs[:n-1]) {
+			return genai.OpEmbeddings
+		}
+	}
+	return ""
+}
+
+// pathSegments returns the cleaned, non-empty `/`-separated segments of
+// urlPath. A trailing slash returns nil — operation endpoints are exact
+// resources, not directories, so `/v1/chat/completions/` is rejected.
+// An empty urlPath returns a nil slice.
+func pathSegments(urlPath string) []string {
+	if urlPath == "" || urlPath == "/" {
+		return nil
+	}
+	// Trailing slash means "this is a directory/collection", not the
+	// operation itself. Reject up front rather than let path.Clean
+	// silently rewrite it away.
+	if strings.HasSuffix(urlPath, "/") {
+		return nil
+	}
+	cleaned := path.Clean(urlPath)
+	if cleaned == "/" || cleaned == "." {
+		return nil
+	}
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	if cleaned == "" {
+		return nil
+	}
+	return strings.Split(cleaned, "/")
+}
+
+// isAPIParent reports whether the segments immediately preceding an
+// operation segment look like a real API namespace boundary. The
+// segment immediately before the operation must be either a version
+// segment (`v\d+`, case-insensitive) or, for the Azure OpenAI deployment
+// shape, follow a `deployments/{name}` pair. Any other parent (e.g.
+// `files`, `.well-known`) is treated as a sub-resource collision and
+// the operation is rejected.
+func isAPIParent(parents []string) bool {
+	if len(parents) == 0 {
+		return false
+	}
+	last := parents[len(parents)-1]
+	if isVersionSegment(last) {
+		return true
+	}
+	// Azure shape: .../deployments/{anything}/<op>
+	if len(parents) >= 2 && parents[len(parents)-2] == "deployments" {
+		return true
+	}
+	return false
+}
+
+// isVersionSegment reports whether s looks like `vN` for some
+// positive-integer N (case-insensitive). Matches `v1`, `V2`, `v10`;
+// rejects `version`, `v`, `v1beta`, `1`.
+func isVersionSegment(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	if s[0] != 'v' && s[0] != 'V' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type openAIRequest struct {
@@ -52,6 +135,11 @@ type openAIRequest struct {
 type openAIMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	// ToolCalls is populated on streaming deltas when the model emits
+	// tool calls instead of (or alongside) text. Held as raw JSON so
+	// the proxy doesn't need to model the per-chunk argument fragment
+	// schema; presence is all the streaming TTFT path needs.
+	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
 }
 
 func (OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
@@ -112,6 +200,21 @@ func (OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, content
 		emitOpenAIRequestEvents(span, req.Messages, content)
 	}
 	return info
+}
+
+// hasToolCalls reports whether a streaming delta's `tool_calls` field
+// represents a non-empty tool-call event. Absent, null, and empty-array
+// shapes all count as "no tool call here" — only a populated array fires.
+func hasToolCalls(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	switch trimmed {
+	case "", "null", "[]":
+		return false
+	}
+	return true
 }
 
 // decodeStopSequences accepts "stop" as either a string or a []string per the
@@ -279,13 +382,21 @@ func (OpenAI) WrapStream(
 			if c.FinishReason != "" {
 				info.FinishReasons = append(info.FinishReasons, c.FinishReason)
 			}
-			if delta := string(c.Delta.Content); delta != "" {
+			delta := string(c.Delta.Content)
+			// A tool-only stream populates delta.tool_calls and leaves
+			// delta.content empty. Both shapes count as a "first token"
+			// for TTFT — without this, tool-using calls record
+			// FirstTokenAt=0 and skew every operator's TTFT histogram.
+			if delta != "" || hasToolCalls(c.Delta.ToolCalls) {
 				if !gotFirst {
 					gotFirst = true
 					info.FirstTokenAt = time.Now()
 					onFirstToken()
 				}
-				if content.Capture {
+				// Only text content is assembled — tool-call arguments
+				// stream as opaque JSON fragments and aren't meaningful
+				// as concatenated text on the trace.
+				if content.Capture && delta != "" {
 					assembled.WriteString(delta)
 				}
 			}
