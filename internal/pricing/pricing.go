@@ -14,6 +14,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -32,8 +33,24 @@ type Rate struct {
 // Table is the active pricing catalogue. Construct via Default for the
 // embedded defaults, or via Load to merge an operator override on top.
 type Table struct {
-	// rates is keyed by gen_ai.system then by model-prefix.
+	// rates is keyed by gen_ai.system then by model-prefix. The map
+	// preserves O(1) system membership and supports the merge path
+	// in Load.
 	rates map[string]map[string]Rate
+	// sorted is the deterministic walk order for lookup, built once
+	// at construction time. Per-system, prefixes are ordered by
+	// length (descending) and then lexicographically (ascending);
+	// the first match wins. This removes the latent dependence on
+	// Go's randomized map iteration order in the cost-computation
+	// data path.
+	sorted map[string][]prefixedRate
+}
+
+// prefixedRate is a (prefix, rate) pair held in the per-system sorted
+// walk order. Kept private; the only consumer is Table.lookup.
+type prefixedRate struct {
+	prefix string
+	rate   Rate
 }
 
 // defaultTable is the embedded built-in catalogue. It is constructed
@@ -46,7 +63,28 @@ func init() {
 	if err := yaml.Unmarshal(embeddedPrices, &parsed); err != nil {
 		panic(fmt.Errorf("pricing: embedded prices.yaml malformed: %w", err))
 	}
-	defaultTable = &Table{rates: parsed}
+	defaultTable = newTable(parsed)
+}
+
+// newTable builds a Table from a parsed (system, prefix, rate) map and
+// precomputes the deterministic per-system walk order. Construction
+// allocates; lookups are read-only and lock-free.
+func newTable(rates map[string]map[string]Rate) *Table {
+	sorted := make(map[string][]prefixedRate, len(rates))
+	for sys, models := range rates {
+		entries := make([]prefixedRate, 0, len(models))
+		for prefix, rate := range models {
+			entries = append(entries, prefixedRate{prefix: prefix, rate: rate})
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if len(entries[i].prefix) != len(entries[j].prefix) {
+				return len(entries[i].prefix) > len(entries[j].prefix)
+			}
+			return entries[i].prefix < entries[j].prefix
+		})
+		sorted[sys] = entries
+	}
+	return &Table{rates: rates, sorted: sorted}
 }
 
 // Default returns the embedded built-in pricing catalogue. The returned
@@ -101,7 +139,7 @@ func Load(path string, failOpen bool) (*Table, error) {
 			merged[sys][k] = v
 		}
 	}
-	return &Table{rates: merged}, nil
+	return newTable(merged), nil
 }
 
 // Cost returns the USD cost for the given token usage against this
@@ -118,25 +156,21 @@ func (t *Table) Cost(system, model string, inputTokens, outputTokens int64) (usd
 }
 
 func (t *Table) lookup(system, model string) (Rate, bool) {
-	table, ok := t.rates[system]
+	entries, ok := t.sorted[system]
 	if !ok {
 		return Rate{}, false
 	}
 	model = strings.ToLower(model)
-	var (
-		bestRate Rate
-		bestLen  = -1
-	)
-	for prefix, r := range table {
-		if !strings.HasPrefix(model, prefix) {
-			continue
-		}
-		if len(prefix) > bestLen {
-			bestRate = r
-			bestLen = len(prefix)
+	// entries is pre-sorted (length desc, then prefix asc); the first
+	// HasPrefix hit is the longest-prefix winner with a stable
+	// lexicographic tiebreak — no map-iteration order in the data
+	// path.
+	for _, e := range entries {
+		if strings.HasPrefix(model, e.prefix) {
+			return e.rate, true
 		}
 	}
-	return bestRate, bestLen >= 0
+	return Rate{}, false
 }
 
 // Cost is a backwards-compatible package-level alias that resolves

@@ -1180,7 +1180,38 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 
 ## Medium — log for next cycle
 
-- [ ] **A17 — Pricing lookup nondeterministic on equal-length prefixes (item 0.6)** 🟡
+- [x] **A17 — Pricing lookup nondeterministic on equal-length prefixes (item 0.6)** 🟡
+  **Finding:** `Table.lookup` ranged the per-system map directly, so
+  the "longest prefix wins" walk depended on Go's randomized map
+  iteration order. With strict `>` the tiebreak was masked for the
+  catalogue as it stands today, but any future shift to `>=`, any
+  added equal-length pair, or any future need to expose ties to
+  operators would surface silently different recorded costs across
+  process restarts. A latent correctness bomb in the cost-recording
+  data path.
+  **Fix:** Introduce a per-system pre-sorted `[]prefixedRate` slice
+  built once at `newTable` time (called from `init()` for the
+  embedded catalogue and from `Load` for operator merges). Order is
+  length descending, then prefix ascending — first match wins. The
+  `rates map[string]map[string]Rate` stays as the merge-time
+  primary; `sorted map[string][]prefixedRate` is the read-side walk
+  order. `lookup` walks `sorted` and returns on first
+  `HasPrefix` hit, so the data path no longer touches map iteration
+  at all.
+  **Evidence:**
+  - `internal/pricing/override_test.go` adds
+    `TestPricingEqualLengthIsDeterministic` — registers a synthetic
+    system with mixed-length prefixes ("moda"/"modb",
+    "x-aa"/"x-bb"/"x-aaab", "ab"/"ab-extra") via a `Load` override,
+    asserts identical USD across 1000 serial iterations per probe
+    AND 64 goroutines × 200 calls per probe. With the sort
+    direction flipped (regression simulation), the test fails on
+    the mixed-length probes — confirming the assertion bites.
+  - All existing `pricing_test.go` and `override_test.go` cases
+    stay green; the longest-prefix-wins contract is preserved by
+    construction.
+  - `go test -C . -race -count=1 ./...` green across the repo.
+  - `golangci-lint run --timeout=2m ./...` zero issues.
 - [ ] **A18 — Upstream cert pinning (item 1.2)** 🟡
 - [ ] **A19 — `/healthz` / `/readyz` endpoints (item 1.3)** 🟡
 - [ ] **A20 — Shutdown waits on active streams (item 1.4)** 🟡
