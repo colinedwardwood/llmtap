@@ -104,15 +104,47 @@ func applyAll(s string, pats []replacer) string {
 
 var (
 	// defaultPatterns: high-confidence credential / PII markers.
+	// Provider coverage is best-effort: we catch every shape that has
+	// a distinguishing prefix or fixed-width body. Providers whose
+	// tokens are bare hex (Mistral, Together, Cohere) can't be matched
+	// without false-positive-bombing arbitrary hex strings in prose —
+	// those operators should pair `redact: default` with a custom
+	// collector-side scrubber.
 	defaultPatterns = []replacer{
-		// OpenAI / Stripe-style "sk-" keys: at least 20 chars of
-		// [A-Za-z0-9_-] after the prefix. The 20-char floor cuts
-		// down on false positives from prose like "sk-and-flowers".
+		// OpenAI / Stripe / Anthropic / DeepSeek "sk-" keys: at least
+		// 20 chars of [A-Za-z0-9_-] after the prefix. The 20-char
+		// floor cuts down on false positives from prose like
+		// "sk-and-flowers". Anthropic's `sk-ant-api03-…` matches this
+		// pattern as a side effect (the body is longer than 20 chars).
 		regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`),
-		// Slack bot / user tokens.
+		// Slack bot / user / app / refresh / svc tokens.
 		regexp.MustCompile(`\bxox[abprs]-[A-Za-z0-9-]{10,}\b`),
 		// AWS access key ID.
 		regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+		// Google AI Studio / Cloud API keys: literal `AIza` prefix
+		// followed by exactly 35 chars of [A-Za-z0-9_-]. The fixed
+		// length is the right anchor — Google's keys are uniform 39
+		// chars total.
+		regexp.MustCompile(`\bAIza[A-Za-z0-9_-]{35}\b`),
+		// Groq API keys: `gsk_` prefix + alphanumeric body. The
+		// public docs show 52-char bodies today, but the prefix is
+		// distinctive enough on its own — use {20,} so the pattern
+		// survives Groq tweaking the body length.
+		regexp.MustCompile(`\bgsk_[A-Za-z0-9]{20,}\b`),
+		// Replicate API tokens: `r8_` prefix + 20+ chars. Lower
+		// bound is conservative; real tokens are longer.
+		regexp.MustCompile(`\br8_[A-Za-z0-9]{20,}\b`),
+		// GitHub classic / app tokens. The `gh_` family share a
+		// 36-char floor; loose upper bound covers forward growth.
+		regexp.MustCompile(`\bghp_[A-Za-z0-9]{36,255}\b`),
+		regexp.MustCompile(`\bgho_[A-Za-z0-9]{36,255}\b`),
+		regexp.MustCompile(`\bghu_[A-Za-z0-9]{36,255}\b`),
+		regexp.MustCompile(`\bghs_[A-Za-z0-9]{36,255}\b`),
+		regexp.MustCompile(`\bghr_[A-Za-z0-9]{36,255}\b`),
+		// GitHub fine-grained PATs are variable-length (~80-90 chars
+		// in 2026); the underscore in the body class is required
+		// because some fine-grained tokens contain `_`.
+		regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{40,255}\b`),
 		// GCP service-account JSON: the "private_key" field is a
 		// fingerprint. Match conservatively on the JSON key shape.
 		regexp.MustCompile(`"private_key"\s*:\s*"[^"]+"`),

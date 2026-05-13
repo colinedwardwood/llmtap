@@ -62,6 +62,36 @@ func TestApplyDefaultMasksHighConfidenceSecrets(t *testing.T) {
 			masks: []string{"BEGIN PRIVATE KEY"},
 			keeps: []string{"service_account"},
 		},
+		{
+			name:  "Google AI Studio API key",
+			in:    "gemini key: AIzaSyB0CdEfGhIjKlMnOpQrStUvWxYz0123456",
+			masks: []string{"AIzaSyB0CdEfGhIjKlMnOpQrStUvWxYz0123456"},
+			keeps: []string{"gemini key"},
+		},
+		{
+			name:  "Groq API key",
+			in:    "GROQ_API_KEY=gsk_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789aaaaaaaaaaaaaaaaaaaaaa",
+			masks: []string{"gsk_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789aaaaaaaaaaaaaaaaaaaaaa"},
+			keeps: []string{"GROQ_API_KEY"},
+		},
+		{
+			name:  "Replicate token",
+			in:    "replicate-token: r8_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789aaa",
+			masks: []string{"r8_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789aaa"},
+			keeps: []string{"replicate-token"},
+		},
+		{
+			name:  "GitHub personal access token (classic)",
+			in:    "GITHUB_TOKEN=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz01234567890aA",
+			masks: []string{"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz01234567890aA"},
+			keeps: []string{"GITHUB_TOKEN"},
+		},
+		{
+			name:  "GitHub fine-grained PAT",
+			in:    "token: github_pat_11ABCDE000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			masks: []string{"github_pat_11ABCDE000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			keeps: []string{"token:"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
