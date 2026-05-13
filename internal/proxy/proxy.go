@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -251,10 +253,16 @@ func buildUpstreamTransport(u config.Upstream, target *url.URL) (*http.Transport
 	}
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		// ServerName is normally inferred from the request URL, but
-		// the proxy rewrites the request to target the upstream's
-		// host, so we set it explicitly to make SNI deterministic.
-		ServerName: target.Hostname(),
+	}
+	// ServerName is normally inferred from the request URL, but the
+	// proxy rewrites the request to target the upstream's host, so we
+	// set it explicitly to make SNI deterministic. The TLS spec
+	// (RFC 6066 §3) disallows IP literals in the SNI extension; many
+	// upstreams + some hostile middleboxes reject the handshake when
+	// it shows up. Skip the ServerName assignment when target.Hostname()
+	// is a parseable IP — TLS will fall back to its IP-based default.
+	if host := target.Hostname(); net.ParseIP(host) == nil {
+		tlsCfg.ServerName = host
 	}
 	if len(u.PinSHA256) > 0 {
 		pins, err := parsePins(u.PinSHA256)
@@ -323,31 +331,35 @@ func makeConnVerifier(pins [][]byte) func(cs tls.ConnectionState) error {
 	}
 }
 
-// matchPin checks the leaf's SPKI sha256 against the pin set.
+// matchPin checks the leaf's SPKI sha256 against the pin set. Uses
+// crypto/subtle.ConstantTimeCompare so a partial-match timing oracle
+// can't leak which pin is closest to the peer's actual SPKI digest.
 func matchPin(leaf *x509.Certificate, pins [][]byte) error {
 	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 	for _, p := range pins {
-		if bytesEqual(p, sum[:]) {
+		if subtle.ConstantTimeCompare(p, sum[:]) == 1 {
 			return nil
 		}
 	}
 	return fmt.Errorf("upstream pin: leaf SPKI sha256 %x not in pin set", sum[:])
 }
 
-// bytesEqual is a tiny constant-time-ish equality check on equal-length
-// byte slices. We don't pull in crypto/subtle because the input length
-// is fixed at 32 and operator pin lists are short.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
-}
-
+// ServeHTTP is the proxy's request entry point. The flow is a flat
+// pipeline of named gates, each of which either rejects with a
+// terminal HTTP status OR falls through to the next:
+//
+//	health probes  → /healthz, /readyz
+//	auth gate      → 401 / 429
+//	upstream match → 404
+//	admit          → 503 (breaker) / 429 (concurrency)
+//	body cap       → 413
+//	dispatch       → transparent passthrough OR enriched pipeline
+//
+// The admit + release pair (C1) is the load-bearing invariant: every
+// path that reaches admit() must reach exactly one release() call
+// with the resolved status code, regardless of which gate downstream
+// terminates the request. release() forwards the resolved status code
+// to the breaker so the half-open probe slot is always cleared.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Health probes are answered before any auth gate and before
 	// config.Match — operators (and Kubernetes) need to probe llmtap
@@ -364,56 +376,172 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if h.auth.Enabled() && !h.checkAuth(r) {
+	if !h.applyAuthGate(w, r) {
+		return
+	}
+
+	upstream, rp, ok := h.matchUpstream(w, r)
+	if !ok {
+		return
+	}
+
+	// Admit: claim the breaker probe slot (if half-open) and the
+	// per-upstream concurrency slot. From here on, every exit path
+	// MUST go through adm.release() so the breaker doesn't get
+	// stuck in half-open with probeInFlight=true.
+	adm, ok := h.admit(w, upstream)
+	if !ok {
+		return
+	}
+
+	// statusCapture wraps the response writer so adm.release() can
+	// read the final status code that reached the client and fold it
+	// into the breaker. Without this wrapper, transparent passthrough
+	// paths (op=="" and the body-read-error fallback) would never
+	// report anything to the breaker.
+	capW := &statusCaptureWriter{ResponseWriter: w}
+	defer adm.release(capW)
+
+	h.dispatch(capW, r, upstream, rp)
+}
+
+// applyAuthGate runs the auth verifier. Returns true when the request
+// is admitted, false when a response was written. authBusy maps to
+// 429 (the argon2 semaphore is saturated); authRejected maps to 401.
+func (h *Handler) applyAuthGate(w http.ResponseWriter, r *http.Request) bool {
+	if !h.auth.Enabled() {
+		return true
+	}
+	switch h.checkAuth(r) {
+	case authOK:
+		return true
+	case authBusy:
+		// argon2 semaphore saturated: refuse with 429 + Retry-After
+		// instead of queueing more 64 MiB allocations behind the
+		// existing in-flight work. The auth gate is intentionally
+		// the loudest backpressure surface — operators see auth-cost
+		// shedding before the upstream concurrency cap fires.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "auth verifier busy", http.StatusTooManyRequests)
+		return false
+	default:
 		// 401 with no upstream contact. Do not echo the supplied token,
 		// even truncated — a noisy 401 helps an attacker time their
 		// guess.
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return false
 	}
+}
 
+// matchUpstream finds the upstream + ReverseProxy for r.URL.Path.
+// Returns (_, _, false) and writes 404 when no upstream matches.
+func (h *Handler) matchUpstream(w http.ResponseWriter, r *http.Request) (config.Upstream, *httputil.ReverseProxy, bool) {
 	upstream, ok := h.cfg.Match(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
-		return
+		return config.Upstream{}, nil, false
 	}
 	rp, ok := h.rps[upstream.Name]
 	if !ok {
 		http.NotFound(w, r)
-		return
+		return config.Upstream{}, nil, false
 	}
+	return upstream, rp, true
+}
 
-	// Circuit-breaker admission check. Runs BEFORE the concurrency
-	// semaphore so an open breaker doesn't burn a slot. When the
-	// breaker is open / half-open with a probe in flight, the proxy
-	// responds 503 + Retry-After without touching the upstream.
-	if br := h.breakers[upstream.Name]; br != nil {
-		if ok, retryAfter := br.admit(); !ok {
+// admission bundles the per-upstream resources that ServeHTTP has
+// claimed on behalf of a request: the breaker probe slot (if any),
+// and the concurrency semaphore slot (if any). release() returns
+// every slot it took. The release() call is the only path that reports
+// the final status code to the breaker.
+type admission struct {
+	// br is nil when no breaker is configured for the upstream.
+	br *breaker
+	// sem is nil when no concurrency cap is configured.
+	sem chan struct{}
+	// breakerReleased guards against double-reporting when the enriched
+	// path's finalize() ALSO calls release() (defence in depth — today
+	// only ServeHTTP's defer calls release).
+	breakerReleased bool
+}
+
+// admit runs the breaker admit check, then the concurrency semaphore
+// try-acquire. Returns (_, false) and writes a 503 / 429 when either
+// gate rejects. When admit returns (adm, true), the caller MUST call
+// adm.release exactly once.
+//
+// Breaker admit happens BEFORE the concurrency semaphore: an open
+// breaker should NOT consume a concurrency slot. The order also
+// ensures release() runs in reverse — concurrency slot first
+// (immediately on return), breaker.report last (status code in hand).
+func (h *Handler) admit(w http.ResponseWriter, upstream config.Upstream) (*admission, bool) {
+	adm := &admission{br: h.breakers[upstream.Name]}
+	if adm.br != nil {
+		ok, retryAfter := adm.br.admit()
+		if !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			http.Error(w, "upstream circuit breaker open", http.StatusServiceUnavailable)
-			return
+			return nil, false
 		}
 	}
-
-	// Per-upstream concurrency cap. Acquire BEFORE any body read or
-	// span/metric work so a flood doesn't waste those resources.
 	if sem := h.upstreamSem[upstream.Name]; sem != nil {
 		select {
 		case sem <- struct{}{}:
-			defer func() { <-sem }()
+			adm.sem = sem
 		default:
+			// Roll back the breaker admission so the probe slot
+			// doesn't leak into the half-open state — concurrency
+			// rejection is a no-upstream-contact event, not a probe
+			// outcome.
+			if adm.br != nil {
+				adm.br.report(http.StatusTooManyRequests)
+			}
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "upstream concurrency limit reached", http.StatusTooManyRequests)
-			return
+			return nil, false
 		}
 	}
+	return adm, true
+}
 
+// release returns the concurrency slot to the semaphore (if any) and
+// reports the captured status code to the breaker (if any). Idempotent
+// against double-release on the breaker — the enriched path's
+// responseInterceptor used to call br.report directly; release() owns
+// that responsibility now, so double-reporting can't double-trip the
+// breaker.
+//
+// status comes from the statusCaptureWriter that wraps w; a missing
+// status (i.e. zero) is mapped to 502 because a request that admitted
+// but produced no response is, from the breaker's perspective, an
+// upstream-side fault.
+func (a *admission) release(cw *statusCaptureWriter) {
+	if a.sem != nil {
+		<-a.sem
+	}
+	if a.br != nil && !a.breakerReleased {
+		a.breakerReleased = true
+		code := cw.status
+		if code == 0 {
+			code = http.StatusBadGateway
+		}
+		a.br.report(code)
+	}
+}
+
+// dispatch is the post-admission body of ServeHTTP. It either forwards
+// transparently (no enrichment) or runs the full enriched pipeline.
+// Every exit returns to ServeHTTP, where adm.release() folds the
+// captured status code into the breaker.
+func (h *Handler) dispatch(w *statusCaptureWriter, r *http.Request, upstream config.Upstream, rp *httputil.ReverseProxy) {
 	prv := h.providers[upstream.Provider]
 	op := prv.OperationFor(r.URL.Path)
 
 	if op == "" {
 		// Path is owned by this upstream but isn't a recognised LLM
 		// endpoint (e.g. /v1/files): forward without enrichment.
+		// The status captured by w flows into release()'s
+		// breaker.report so the half-open probe slot still clears.
 		rp.ServeHTTP(w, r)
 		return
 	}
@@ -422,7 +550,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.inflight.Add(r.Context(), -1, metric.WithAttributes(attribute.String("upstream", upstream.Name)))
 
 	// Hard-cap pre-check: if the caller advertises a body above the
-	// configured ceiling, refuse before we drain any bytes.
+	// configured ceiling, refuse before we drain any bytes. The 413
+	// status flows into release() via the wrapper.
 	if hardCap := h.cfg.Request.MaxBodyBytes; hardCap > 0 && r.ContentLength > hardCap {
 		http.Error(w, "request body exceeds maximum", http.StatusRequestEntityTooLarge)
 		return
@@ -459,6 +588,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// finalize covers the non-streaming path and any 4xx/5xx where the
 	// streaming wrapper never closed. It is idempotent.
 	finalize(ctx)
+}
+
+// statusCaptureWriter records the first status code written to the
+// response so adm.release() can fold it into the breaker after the
+// handler returns. Without this wrapper, the transparent-passthrough
+// paths in dispatch() would never tell the breaker what happened, and
+// a half-open probe slot would leak forever.
+//
+// The wrapper preserves http.Flusher (httputil.ReverseProxy uses it
+// when FlushInterval=-1) and http.Hijacker so streaming responses
+// still flush per-write. http.CloseNotifier is intentionally NOT
+// preserved — it has been deprecated since Go 1.11.
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusCaptureWriter) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusCaptureWriter) Write(p []byte) (int, error) {
+	if s.status == 0 {
+		// stdlib semantics: a Write before WriteHeader implies 200.
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(p)
+}
+
+// Flush forwards to the underlying writer when it supports
+// http.Flusher. httputil.ReverseProxy needs this for FlushInterval=-1
+// streaming.
+func (s *statusCaptureWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the underlying writer so callers that type-assert
+// for http.Hijacker or other optional interfaces still see them.
+// Go 1.20+ http stack honours Unwrap for ResponseController.
+func (s *statusCaptureWriter) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
 }
 
 // responseInterceptor returns:
@@ -500,18 +675,12 @@ func (h *Handler) responseInterceptor(
 				))
 			}
 		}
-		// Fold the upstream's response into the circuit breaker so a
-		// burst of 5xx trips it without needing per-request bookkeeping
-		// at the call site. statusCode = 0 means the proxy never got a
-		// response (e.g. ErrorHandler took over with 502); that's an
-		// upstream-side fault — count it as a 502.
-		if br := h.breakers[upstreamName]; br != nil {
-			code := statusCode
-			if code == 0 {
-				code = http.StatusBadGateway
-			}
-			br.report(code)
-		}
+		// The circuit breaker is fed from ServeHTTP's admission release
+		// path (C1) — NOT from here. release() reads the final status
+		// code that reached the client via the statusCaptureWriter
+		// wrapper and folds it into the breaker. That central reporting
+		// is the only thing that prevents transparent-passthrough and
+		// hard-cap-reject paths from leaking the half-open probe slot.
 		span.End()
 	}
 
@@ -839,22 +1008,41 @@ func truncateUTF8(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// authVerdict captures the auth gate's decision for a request. The
+// proxy translates each verdict into the appropriate HTTP response
+// without re-examining the credential.
+type authVerdict int
+
+const (
+	authOK       authVerdict = iota // verified — admit
+	authRejected                    // missing / wrong / malformed token
+	authBusy                        // argon2 semaphore saturated — 429
+)
+
 // checkAuth pulls the bearer token out of the configured request
 // header, strips the optional "Bearer " prefix, and asks the verifier
 // to constant-time match it. Also strips the header from the inbound
 // request so it does not get forwarded to upstream (the verified
 // token is llmtap's secret, not the LLM provider's).
-func (h *Handler) checkAuth(r *http.Request) bool {
+func (h *Handler) checkAuth(r *http.Request) authVerdict {
 	raw := r.Header.Get(h.authHeader)
 	r.Header.Del(h.authHeader)
 	if raw == "" {
-		return false
+		return authRejected
 	}
 	// Accept either `Bearer <token>` or a bare token, so operators
 	// can choose between matching standard reverse-proxy convention
 	// and using a custom header naked.
 	raw = strings.TrimPrefix(raw, "Bearer ")
-	return h.auth.Verify(raw)
+	ok, busy := h.auth.Verify(raw)
+	switch {
+	case ok:
+		return authOK
+	case busy:
+		return authBusy
+	default:
+		return authRejected
+	}
 }
 
 // WrapWithOTel returns the handler wrapped in otelhttp middleware so llmtap's
