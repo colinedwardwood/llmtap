@@ -60,7 +60,16 @@ type GenAIMeters struct {
 	TokenUsage        metric.Int64Histogram
 	OperationDuration metric.Float64Histogram
 	TimeToFirstToken  metric.Float64Histogram
-	CostUSD           metric.Float64Counter
+	// CostUSD is the per-call cost histogram. Dashboards reach p50/p95
+	// cost per operation via this; PromQL `_sum` series gives the
+	// running spend if the float-counter drift on .Total isn't a
+	// concern.
+	CostUSD metric.Float64Histogram
+	// CostUSDTotal is the monotonic cumulative-spend counter. Use this
+	// when a single integer-cumulative metric is preferable to the
+	// histogram's _sum (e.g. when downsampling or recording rules
+	// would lose the count series).
+	CostUSDTotal metric.Float64Counter
 }
 
 // Setup builds traces+metrics+logs providers, registers them globally so
@@ -129,6 +138,7 @@ func Setup(ctx context.Context, cfg config.Config) (Providers, error) {
 }
 
 func buildResource(ctx context.Context, cfg config.Config) (*resource.Resource, error) {
+	version, _, _ := buildinfo.Resolve()
 	return resource.New(ctx,
 		resource.WithFromEnv(),
 		resource.WithProcess(),
@@ -138,7 +148,7 @@ func buildResource(ctx context.Context, cfg config.Config) (*resource.Resource, 
 		resource.WithAttributes(
 			semconv.ServiceName(cfg.Service.Name),
 			semconv.ServiceNamespace(cfg.Service.Namespace),
-			semconv.ServiceVersion(buildinfo.Version),
+			semconv.ServiceVersion(version),
 			semconv.DeploymentEnvironment(cfg.Service.Env),
 		),
 	)
@@ -288,10 +298,22 @@ func newGenAIMeters(m metric.Meter) (GenAIMeters, error) {
 	if err != nil {
 		return GenAIMeters{}, err
 	}
-	cost, err := m.Float64Counter(
+	// Per-call cost histogram. USD-scaled buckets span free-tier
+	// embeddings ($0.00002 / call) through expensive single inferences
+	// (~$100 / call for very long gpt-4-class contexts).
+	cost, err := m.Float64Histogram(
 		genai.MetricCostUSD,
 		metric.WithUnit("USD"),
-		metric.WithDescription("Estimated USD cost of GenAI requests, computed from a configurable price table."),
+		metric.WithDescription("Distribution of per-call USD cost, computed from a configurable price table."),
+		metric.WithExplicitBucketBoundaries(1e-5, 1e-4, 1e-3, 0.01, 0.1, 1, 10, 100),
+	)
+	if err != nil {
+		return GenAIMeters{}, err
+	}
+	costTotal, err := m.Float64Counter(
+		genai.MetricCostUSDTotal,
+		metric.WithUnit("USD"),
+		metric.WithDescription("Monotonic cumulative USD cost of GenAI requests. Sibling to the cost histogram; the counter avoids float drift on the histogram _sum across millions of small adds."),
 	)
 	if err != nil {
 		return GenAIMeters{}, err
@@ -301,5 +323,6 @@ func newGenAIMeters(m metric.Meter) (GenAIMeters, error) {
 		OperationDuration: dur,
 		TimeToFirstToken:  ttft,
 		CostUSD:           cost,
+		CostUSDTotal:      costTotal,
 	}, nil
 }

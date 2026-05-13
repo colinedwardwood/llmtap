@@ -52,8 +52,9 @@ func run(args []string, stderr io.Writer) error {
 	case "hash-token":
 		return runHashToken(rest, os.Stdin, os.Stdout, stderr)
 	case "version", "--version", "-v":
+		version, commit, date := buildinfo.Resolve()
 		_, _ = fmt.Fprintf(stderr, "llmtap %s (commit %s, built %s)\n",
-			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
+			version, commit, date)
 		return nil
 	case "help", "--help", "-h":
 		usage(stderr)
@@ -131,7 +132,8 @@ func runUp(args []string, stderr io.Writer) error {
 		return fmt.Errorf("telemetry: %w", err)
 	}
 
-	logger, err := newLogger(*logLevel, cfg.Service.Name, buildinfo.Version, stderr)
+	version, _, _ := buildinfo.Resolve()
+	logger, err := newLogger(*logLevel, cfg.Service.Name, version, stderr)
 	if err != nil {
 		return err
 	}
