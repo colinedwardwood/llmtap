@@ -555,11 +555,17 @@ func (h *Handler) responseInterceptor(
 			model = info.RequestModel
 		}
 		if usd, ok := h.pricing.Cost(info.System, model, info.InputTokens, info.OutputTokens); ok {
-			h.meters.CostUSD.Add(ctx, usd, metric.WithAttributes(
+			costAttrs := metric.WithAttributes(
 				attribute.String(genai.AttrSystem, info.System),
 				attribute.String(genai.AttrRequestModel, reqModelLabel),
 				attribute.String(genai.AttrResponseModel, respModelLabel),
-			))
+			)
+			// Per-call distribution + monotonic cumulative. The
+			// histogram serves p50 / p95 cost dashboards; the
+			// counter sidesteps float drift on the histogram _sum
+			// across millions of small adds.
+			h.meters.CostUSD.Record(ctx, usd, costAttrs)
+			h.meters.CostUSDTotal.Add(ctx, usd, costAttrs)
 			span.SetAttributes(attribute.Float64(genai.AttrCostUSD, usd))
 		}
 		h.requests.Add(ctx, 1, attrs)

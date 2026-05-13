@@ -31,7 +31,8 @@ func fakeProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecorder) 
 	tokens, _ := meter.Int64Histogram("gen_ai.client.token.usage")
 	dur, _ := meter.Float64Histogram("gen_ai.client.operation.duration")
 	ttft, _ := meter.Float64Histogram("gen_ai.client.time_to_first_token")
-	cost, _ := meter.Float64Counter("gen_ai.client.cost.usd")
+	cost, _ := meter.Float64Histogram("gen_ai.client.cost.usd")
+	costTotal, _ := meter.Float64Counter("gen_ai.client.cost.usd.total")
 
 	return telemetry.Providers{
 		Tracer: tp.Tracer("test"),
@@ -41,6 +42,7 @@ func fakeProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecorder) 
 			OperationDuration: dur,
 			TimeToFirstToken:  ttft,
 			CostUSD:           cost,
+			CostUSDTotal:      costTotal,
 		},
 		Shutdown: func(context.Context) error { return nil },
 	}, rec

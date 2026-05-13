@@ -65,7 +65,19 @@ const (
 	MetricTokenUsage        = "gen_ai.client.token.usage"
 	MetricOperationDuration = "gen_ai.client.operation.duration"
 	MetricTimeToFirstToken  = "gen_ai.client.time_to_first_token"
-	MetricCostUSD           = "gen_ai.client.cost.usd" // llmtap extension
+	// MetricCostUSD is a USD-scaled histogram of per-call cost — gives
+	// dashboards p50 / p95 cost per operation alongside a running sum.
+	// Histogram buckets at 1e-5, 1e-4, 1e-3, 0.01, 0.1, 1, 10, 100 USD
+	// span free-tier embeddings ($0.00002) through the most expensive
+	// gpt-4-class single calls.
+	MetricCostUSD = "gen_ai.client.cost.usd"
+	// MetricCostUSDTotal is a monotonic counter of cumulative spend.
+	// PromQL `sum(rate(gen_ai_client_cost_usd_total_total[5m])) * 3600`
+	// reads as "USD/hour" — what FinOps dashboards actually plot.
+	// Kept as a sibling rather than reading from the histogram's
+	// _sum series because float-counter drift across millions of small
+	// adds is a known concern.
+	MetricCostUSDTotal = "gen_ai.client.cost.usd.total"
 )
 
 // Token-type label values for MetricTokenUsage.

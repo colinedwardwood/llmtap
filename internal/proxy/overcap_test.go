@@ -29,12 +29,13 @@ func fakeProv(t *testing.T) telemetry.Providers {
 	tokens, _ := meter.Int64Histogram("tu")
 	dur, _ := meter.Float64Histogram("du")
 	ttft, _ := meter.Float64Histogram("ttft")
-	cost, _ := meter.Float64Counter("cost")
+	cost, _ := meter.Float64Histogram("cost")
+	costTotal, _ := meter.Float64Counter("cost.total")
 	return telemetry.Providers{
 		Tracer: tp.Tracer("t"),
 		Meter:  meter,
 		Meters: telemetry.GenAIMeters{
-			TokenUsage: tokens, OperationDuration: dur, TimeToFirstToken: ttft, CostUSD: cost,
+			TokenUsage: tokens, OperationDuration: dur, TimeToFirstToken: ttft, CostUSD: cost, CostUSDTotal: costTotal,
 		},
 		Shutdown: func(context.Context) error { return nil },
 	}
