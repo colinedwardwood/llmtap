@@ -54,7 +54,7 @@ type openAIMessage struct {
 	Content json.RawMessage `json:"content"`
 }
 
-func (OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, captureContent bool) Info {
+func (OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
 	op := (OpenAI{}).OperationFor(urlPath)
 	info := Info{
 		System:    genai.SystemOpenAI,
@@ -108,8 +108,8 @@ func (OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, capture
 	span.SetAttributes(attrs...)
 	span.SetName(genai.SpanName(op, info.RequestModel))
 
-	if captureContent && op == genai.OpChat {
-		emitOpenAIRequestEvents(span, req.Messages)
+	if content.Capture && op == genai.OpChat {
+		emitOpenAIRequestEvents(span, req.Messages, content)
 	}
 	return info
 }
@@ -132,7 +132,7 @@ func decodeStopSequences(raw json.RawMessage) []string {
 	return nil
 }
 
-func emitOpenAIRequestEvents(span trace.Span, msgs []openAIMessage) {
+func emitOpenAIRequestEvents(span trace.Span, msgs []openAIMessage, content ContentOpts) {
 	for _, m := range msgs {
 		eventName := genai.EventUserMessage
 		switch m.Role {
@@ -145,7 +145,7 @@ func emitOpenAIRequestEvents(span trace.Span, msgs []openAIMessage) {
 		}
 		span.AddEvent(eventName, trace.WithAttributes(
 			attribute.String("role", m.Role),
-			attribute.String("content", string(m.Content)),
+			attribute.String("content", content.Clean(string(m.Content))),
 		))
 	}
 }
@@ -177,7 +177,7 @@ type openAIEmbed struct {
 	Index int `json:"index"`
 }
 
-func (OpenAI) ParseResponseJSON(span trace.Span, info *Info, body []byte, captureContent bool) {
+func (OpenAI) ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts) {
 	var resp openAIResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return
@@ -197,12 +197,12 @@ func (OpenAI) ParseResponseJSON(span trace.Span, info *Info, body []byte, captur
 
 	span.SetAttributes(responseAttrs(info)...)
 
-	if captureContent && info.Operation == genai.OpChat {
+	if content.Capture && info.Operation == genai.OpChat {
 		for _, c := range resp.Choices {
 			span.AddEvent(genai.EventChoice, trace.WithAttributes(
 				attribute.Int("index", c.Index),
 				attribute.String("finish_reason", c.FinishReason),
-				attribute.String("message", string(c.Message.Content)),
+				attribute.String("message", content.Clean(string(c.Message.Content))),
 			))
 		}
 	}
@@ -248,7 +248,7 @@ func (OpenAI) WrapStream(
 	span trace.Span,
 	info *Info,
 	body io.ReadCloser,
-	captureContent bool,
+	content ContentOpts,
 	onFirstToken func(),
 	onDone func(),
 ) io.ReadCloser {
@@ -285,7 +285,7 @@ func (OpenAI) WrapStream(
 					info.FirstTokenAt = time.Now()
 					onFirstToken()
 				}
-				if captureContent {
+				if content.Capture {
 					assembled.WriteString(delta)
 				}
 			}
@@ -298,9 +298,9 @@ func (OpenAI) WrapStream(
 		}
 		info.Finished = time.Now()
 		span.SetAttributes(responseAttrs(info)...)
-		if captureContent && assembled.Len() > 0 {
+		if content.Capture && assembled.Len() > 0 {
 			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.String("message", assembled.String()),
+				attribute.String("message", content.Clean(assembled.String())),
 			))
 		}
 		onDone()

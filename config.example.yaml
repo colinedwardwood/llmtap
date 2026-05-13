@@ -59,13 +59,30 @@ telemetry:
   # headers:
   #   X-Scope-OrgID: tenant-1
 
-# Prompt/completion content capture. Default is "off" — only metadata
-# (model, tokens, finish reasons) leaves the proxy. Switch to "events" to
-# attach content as span events, or "logs" to send via the OTel log signal.
-# Anything other than "off" should be paired with redaction at your
-# collector or a tightly scoped retention window.
+# Prompt/completion content capture. mode controls whether content is
+# emitted at all; redact scrubs every captured string before it reaches
+# a span attribute.
+#
+#   mode: off|events|logs
+#     off    - only metadata (model, tokens, finish reasons) leaves
+#              the proxy. Default.
+#     events - attach content as span events.
+#     logs   - send content via the OTel log signal (retention can be
+#              scoped separately at the collector).
+#
+#   redact: off|default|strict
+#     off     - passthrough, no scrubbing. Must be explicit opt-in.
+#     default - mask high-confidence credential / PII markers:
+#               OpenAI sk-, Slack xox*, AWS AKIA, GCP service-account
+#               private_key, common JWT shape, emails. RECOMMENDED.
+#     strict  - default + credit-card (Luhn-validated) + US SSN +
+#               E.164 phone numbers. For regulated workloads.
+#
+# Default value is "default" so flipping mode to events without
+# thinking about redaction doesn't silently ship secrets.
 content:
   mode: off
+  redact: default
 
 http:
   read_header_timeout: 30s

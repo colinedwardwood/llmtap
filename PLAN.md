@@ -1146,12 +1146,37 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   - Local coverage measurement confirms current 63.5% on
     `internal/`, above the 60% gate.
 
-- [ ] **A16 — Content redaction profiles (item 1.1)** 🔴
+- [x] **A16 — Content redaction profiles (item 1.1)** 🔴
   **Finding:** `content.mode: events` ships unredacted prompts. The
   "pair with collector redaction" workaround is not a credible
   privacy story for the proxy's target audience.
-  **Fix:** Built-in `default`/`strict`/`off` redaction profiles,
-  applied at the proxy before any export.
+  **Fix:** New `internal/redact` package with three profiles
+  (`off`, `default`, `strict`), `Apply(s, profile)` and `Func(profile)`
+  helpers. The `default` profile masks high-confidence credential /
+  PII patterns (OpenAI `sk-…`, Slack `xox*`, AWS `AKIA…`, GCP
+  service-account `private_key`, common JWT shape, RFC-5322 emails);
+  `strict` adds Luhn-validated credit cards, US SSNs, and E.164
+  phone numbers. Replaced the `captureContent bool` parameter on the
+  Provider interface with a `provider.ContentOpts{Capture, Redact}`
+  struct + a `Clean(s string) string` helper. Every content-emission
+  site in `openai.go` and `anthropic.go` now funnels through
+  `content.Clean(...)`. Proxy constructs the ContentOpts once per
+  request from `cfg.Content.{Mode,Redact}`; the default config ships
+  `redact: default` so flipping `mode: events` doesn't silently ship
+  raw secrets — the privacy story has to survive a single config
+  edit.
+  **Evidence:**
+  - `internal/redact/redact_test.go` — golden corpus per profile:
+    off is passthrough, default masks each named pattern AND leaves
+    common prose alone (false-positive guard), strict adds the
+    Luhn-validated CC + SSN + E.164 patterns, Func returns nil for
+    `off` so callers can skip work.
+  - `internal/proxy/redact_integration_test.go` end-to-end:
+    `TestProxyRedactsContentEventsByDefault` proves the
+    default-shipped config strips an `sk-…` from a prompt before it
+    reaches any span event; `TestProxyRedactOffIsPassthrough`
+    proves the explicit opt-out passes content verbatim.
+  - `config.Validate` refuses unknown values for `content.redact`.
 
 ## Medium — log for next cycle
 

@@ -27,6 +27,7 @@ import (
 	"github.com/colinedwardwood/llmtap/internal/labels"
 	"github.com/colinedwardwood/llmtap/internal/pricing"
 	"github.com/colinedwardwood/llmtap/internal/provider"
+	"github.com/colinedwardwood/llmtap/internal/redact"
 	"github.com/colinedwardwood/llmtap/internal/telemetry"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -256,10 +257,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		trace.WithSpanKind(trace.SpanKindClient),
 	)
 
-	captureContent := h.cfg.Content.Mode == config.CaptureEvents
-	info := prv.ParseRequest(span, r.URL.Path, body, captureContent)
+	contentOpts := provider.ContentOpts{
+		Capture: h.cfg.Content.Mode == config.CaptureEvents,
+		Redact:  redact.Func(redact.Profile(h.cfg.Content.Redact)),
+	}
+	info := prv.ParseRequest(span, r.URL.Path, body, contentOpts)
 
-	finalize, modify := h.responseInterceptor(prv, &info, captureContent, span, upstream.Name)
+	finalize, modify := h.responseInterceptor(prv, &info, contentOpts, span, upstream.Name)
 	ctx = context.WithValue(ctx, ctxKeyModify, modify)
 	rp.ServeHTTP(w, r.WithContext(ctx))
 
@@ -278,7 +282,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) responseInterceptor(
 	prv provider.Provider,
 	info *provider.Info,
-	captureContent bool,
+	content provider.ContentOpts,
 	span trace.Span,
 	upstreamName string,
 ) (finalize func(context.Context), modify modifyFn) {
@@ -300,10 +304,10 @@ func (h *Handler) responseInterceptor(
 		span.SetAttributes(attribute.Int("http.response.status_code", statusCode))
 		if errCapture != nil {
 			span.SetAttributes(attribute.Int("http.response.body_size", errCapture.total))
-			if captureContent {
+			if content.Capture {
 				span.SetAttributes(attribute.String(
 					"http.response.body_snippet",
-					truncateUTF8(string(errCapture.head), 1024),
+					content.Clean(truncateUTF8(string(errCapture.head), 1024)),
 				))
 			}
 		}
@@ -407,7 +411,7 @@ func (h *Handler) responseInterceptor(
 			// metrics for a completed stream should fire even if the
 			// client has already disconnected.
 			streamCtx := context.WithoutCancel(resp.Request.Context())
-			resp.Body = prv.WrapStream(span, info, resp.Body, captureContent,
+			resp.Body = prv.WrapStream(span, info, resp.Body, content,
 				func() {}, // first-token bookkeeping is internal to provider
 				func() {
 					h.activeStreams.Add(-1)
@@ -423,7 +427,7 @@ func (h *Handler) responseInterceptor(
 		if err != nil {
 			return fmt.Errorf("read response: %w", err)
 		}
-		prv.ParseResponseJSON(span, info, raw, captureContent)
+		prv.ParseResponseJSON(span, info, raw, content)
 		resp.Body = io.NopCloser(bytes.NewReader(raw))
 		resp.ContentLength = int64(len(raw))
 		resp.Header.Del("Content-Length")

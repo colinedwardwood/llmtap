@@ -32,7 +32,7 @@ func TestOpenAIParseRequest(t *testing.T) {
 	tr := tp.Tracer("t")
 	_, span := tr.Start(context.Background(), "init")
 
-	info := OpenAI{}.ParseRequest(span, "/v1/chat/completions", body, false)
+	info := OpenAI{}.ParseRequest(span, "/v1/chat/completions", body, ContentOpts{})
 	span.End()
 
 	if info.Operation != "chat" {
@@ -70,7 +70,7 @@ func TestOpenAIParseResponseJSON(t *testing.T) {
 	_, span := tp.Tracer("t").Start(context.Background(), "init")
 	info := &Info{System: "openai", Operation: "chat"}
 
-	OpenAI{}.ParseResponseJSON(span, info, body, false)
+	OpenAI{}.ParseResponseJSON(span, info, body, ContentOpts{})
 	span.End()
 
 	if info.InputTokens != 10 || info.OutputTokens != 3 {
@@ -114,7 +114,7 @@ func TestOpenAIWrapStreamFinishesOnce(t *testing.T) {
 	info := &Info{System: "openai", Operation: "chat", RequestModel: "gpt-4o-mini"}
 
 	firstToken, done := 0, 0
-	stream := OpenAI{}.WrapStream(span, info, io.NopCloser(strings.NewReader(b.String())), false,
+	stream := OpenAI{}.WrapStream(span, info, io.NopCloser(strings.NewReader(b.String())), ContentOpts{},
 		func() { firstToken++ },
 		func() { done++ },
 	)

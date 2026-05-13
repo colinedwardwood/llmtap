@@ -52,6 +52,31 @@ func (i Info) TimeToFirstTokenSeconds() float64 {
 	return i.FirstTokenAt.Sub(i.Started).Seconds()
 }
 
+// ContentOpts shapes how providers handle prompt/completion content
+// when populating span events.
+type ContentOpts struct {
+	// Capture controls whether content events are emitted at all. When
+	// false, providers attach only metadata (model, parameters, token
+	// counts) — never content.
+	Capture bool
+	// Redact, if non-nil, is applied to every captured content string
+	// before it reaches a span attribute. nil is interpreted as
+	// passthrough (no redaction). Callers should populate this from
+	// internal/redact.Func so the privacy default isn't "off by
+	// accident".
+	Redact func(string) string
+}
+
+// Clean returns s with the configured redactor applied, or s unchanged
+// when Redact is nil. Providers should funnel every captured content
+// string through this method on the way to a span attribute.
+func (o ContentOpts) Clean(s string) string {
+	if o.Redact == nil {
+		return s
+	}
+	return o.Redact(s)
+}
+
 // Provider is the parser contract. Implementations are stateless; per-call
 // state lives on [Info].
 type Provider interface {
@@ -64,15 +89,15 @@ type Provider interface {
 	OperationFor(urlPath string) string
 
 	// ParseRequest decorates span and returns a populated [Info] for the
-	// request. Implementations must not retain body. Setting captureContent
-	// true allows attaching prompt content as span events; false (the
-	// default) restricts attributes to metadata only.
-	ParseRequest(span trace.Span, urlPath string, body []byte, captureContent bool) Info
+	// request. Implementations must not retain body. The ContentOpts
+	// argument governs whether prompt content is attached as span
+	// events and how it is scrubbed before attachment.
+	ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info
 
 	// ParseResponseJSON merges response fields into info from a complete,
 	// non-streaming JSON body. It also decorates span with response
-	// attributes and (when captureContent is true) the choice event.
-	ParseResponseJSON(span trace.Span, info *Info, body []byte, captureContent bool)
+	// attributes and (when content.Capture is true) the choice event.
+	ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts)
 
 	// WrapStream returns a reader that proxies body to the caller unchanged
 	// while parsing SSE events out-of-band. onFirstToken is invoked once
@@ -83,7 +108,7 @@ type Provider interface {
 		span trace.Span,
 		info *Info,
 		body io.ReadCloser,
-		captureContent bool,
+		content ContentOpts,
 		onFirstToken func(),
 		onDone func(),
 	) io.ReadCloser

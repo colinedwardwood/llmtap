@@ -44,7 +44,7 @@ type anthropicMessage struct {
 	Content json.RawMessage `json:"content"`
 }
 
-func (Anthropic) ParseRequest(span trace.Span, urlPath string, body []byte, captureContent bool) Info {
+func (Anthropic) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
 	op := (Anthropic{}).OperationFor(urlPath)
 	info := Info{
 		System:    genai.SystemAnthropic,
@@ -86,10 +86,10 @@ func (Anthropic) ParseRequest(span trace.Span, urlPath string, body []byte, capt
 	span.SetAttributes(attrs...)
 	span.SetName(genai.SpanName(op, info.RequestModel))
 
-	if captureContent {
+	if content.Capture {
 		if len(req.System) > 0 {
 			span.AddEvent(genai.EventSystemMessage, trace.WithAttributes(
-				attribute.String("content", string(req.System)),
+				attribute.String("content", content.Clean(string(req.System))),
 			))
 		}
 		for _, m := range req.Messages {
@@ -99,7 +99,7 @@ func (Anthropic) ParseRequest(span trace.Span, urlPath string, body []byte, capt
 			}
 			span.AddEvent(eventName, trace.WithAttributes(
 				attribute.String("role", m.Role),
-				attribute.String("content", string(m.Content)),
+				attribute.String("content", content.Clean(string(m.Content))),
 			))
 		}
 	}
@@ -124,7 +124,7 @@ type anthropicContent struct {
 	Text string `json:"text"`
 }
 
-func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, captureContent bool) {
+func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts) {
 	var resp anthropicResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return
@@ -143,7 +143,7 @@ func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, cap
 
 	span.SetAttributes(responseAttrs(info)...)
 
-	if captureContent {
+	if content.Capture {
 		var b strings.Builder
 		for _, c := range resp.Content {
 			if c.Type == "text" {
@@ -152,7 +152,7 @@ func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, cap
 		}
 		if b.Len() > 0 {
 			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.String("message", b.String()),
+				attribute.String("message", content.Clean(b.String())),
 			))
 		}
 	}
@@ -180,7 +180,7 @@ func (Anthropic) WrapStream(
 	span trace.Span,
 	info *Info,
 	body io.ReadCloser,
-	captureContent bool,
+	content ContentOpts,
 	onFirstToken func(),
 	onDone func(),
 ) io.ReadCloser {
@@ -217,7 +217,7 @@ func (Anthropic) WrapStream(
 					info.FirstTokenAt = time.Now()
 					onFirstToken()
 				}
-				if captureContent {
+				if content.Capture {
 					assembled.WriteString(ev.Delta.Text)
 				}
 			}
@@ -237,9 +237,9 @@ func (Anthropic) WrapStream(
 		}
 		info.Finished = time.Now()
 		span.SetAttributes(responseAttrs(info)...)
-		if captureContent && assembled.Len() > 0 {
+		if content.Capture && assembled.Len() > 0 {
 			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.String("message", assembled.String()),
+				attribute.String("message", content.Clean(assembled.String())),
 			))
 		}
 		onDone()

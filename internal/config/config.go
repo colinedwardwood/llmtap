@@ -142,6 +142,13 @@ type ContentCapture struct {
 	// (model, tokens, finish reasons). "events" attaches content as span
 	// events. "logs" emits content via the OTel log signal.
 	Mode string `yaml:"mode"`
+	// Redact selects the redaction profile applied to every captured
+	// content string before it reaches a span attribute or the
+	// otelslog bridge. One of "off", "default", "strict". Default is
+	// "default" so an operator who flips Mode to "events" doesn't
+	// silently ship raw secrets — the privacy story has to survive a
+	// single config edit.
+	Redact string `yaml:"redact"`
 }
 
 // HTTPTimeouts shapes the listening server's deadlines. The defaults are
@@ -196,7 +203,7 @@ func Default() Config {
 			SampleRatio: 1.0,
 			Timeout:     10 * time.Second,
 		},
-		Content: ContentCapture{Mode: CaptureOff},
+		Content: ContentCapture{Mode: CaptureOff, Redact: "default"},
 		HTTP: HTTPTimeouts{
 			ReadHeaderTimeout: 30 * time.Second,
 			IdleTimeout:       120 * time.Second,
@@ -362,6 +369,14 @@ func (c *Config) Validate() error {
 		}
 	default:
 		errs = append(errs, fmt.Errorf("content.mode %q: must be off|events|logs", c.Content.Mode))
+	}
+	switch c.Content.Redact {
+	case "off", "default", "strict", "":
+		if c.Content.Redact == "" {
+			c.Content.Redact = "default"
+		}
+	default:
+		errs = append(errs, fmt.Errorf("content.redact %q: must be off|default|strict", c.Content.Redact))
 	}
 
 	return errors.Join(errs...)
