@@ -21,13 +21,20 @@ const maxEventBytes = 1024 * 1024 // 1 MiB
 // request goroutine; staying single-threaded avoids a goroutine per in-flight
 // request and removes a class of leak.
 type sseTee struct {
-	src        io.ReadCloser
-	buf        bytes.Buffer
-	onEvent    func(event string, data []byte)
-	onOverflow func() // optional; called once when buf exceeds maxEventBytes
+	src     io.ReadCloser
+	buf     bytes.Buffer
+	onEvent func(event string, data []byte)
+	// onOverflow fires every time the parser buffer crosses
+	// maxEventBytes. A one-shot signal hides sustained pathological
+	// streams (a 100 MiB no-separator payload looked identical to a
+	// 2 MiB one); firing each ~1 MiB chunk gives operators a real
+	// "this stream is still pathological" signal without flooding —
+	// the cap is the overflow rate, not the call count. Callers
+	// dedupe at the span/metric layer if they need to.
+	onOverflow func()
 	onClose    func()
 	once       sync.Once
-	overflowed bool
+	overflows  int // total overflow events on this stream; exported via Overflows().
 }
 
 func newSSETee(src io.ReadCloser, onEvent func(event string, data []byte), onOverflow, onClose func()) *sseTee {
@@ -39,15 +46,15 @@ func (t *sseTee) Read(p []byte) (int, error) {
 	if n > 0 {
 		_, _ = t.buf.Write(p[:n])
 		if t.buf.Len() > maxEventBytes {
-			// Pathological / hostile stream — drop accumulator and
-			// announce overflow once. Bytes still flow to the client
-			// via the n we return; only the SSE parser gives up.
+			// Pathological / hostile stream — drop the accumulator
+			// and announce overflow. Bytes still flow to the client
+			// via the n we return; only the SSE parser gives up on
+			// this chunk. Firing per-overflow (vs. once-per-stream)
+			// surfaces sustained hostile streams to operators.
 			t.buf.Reset()
-			if !t.overflowed {
-				t.overflowed = true
-				if t.onOverflow != nil {
-					t.onOverflow()
-				}
+			t.overflows++
+			if t.onOverflow != nil {
+				t.onOverflow()
 			}
 		} else {
 			t.drain(false)
@@ -64,6 +71,13 @@ func (t *sseTee) Close() error {
 	t.once.Do(t.onClose)
 	return t.src.Close()
 }
+
+// Overflows returns the total number of buffer-overflow events on this
+// stream. Useful in onClose to record a single span attribute summarising
+// "this stream was pathological N times" rather than emitting N span
+// events. Always safe to call after the stream is closed; reads on an
+// in-flight stream race with Read and should be avoided.
+func (t *sseTee) Overflows() int { return t.overflows }
 
 // drain extracts complete SSE messages (delimited by a blank line) from the
 // buffer. When eof is true, any trailing message without a terminating blank

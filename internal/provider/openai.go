@@ -403,6 +403,7 @@ func (OpenAI) WrapStream(
 		}
 	}
 
+	var tee *sseTee
 	closer := func() {
 		if !info.Finished.IsZero() {
 			return
@@ -414,11 +415,14 @@ func (OpenAI) WrapStream(
 				attribute.String("message", content.Clean(assembled.String())),
 			))
 		}
+		if n := tee.Overflows(); n > 0 {
+			span.SetAttributes(attribute.Int("llmtap.sse_parser_overflows", n))
+		}
 		onDone()
 	}
 
-	overflow := func() { span.AddEvent("llmtap.sse_parser_overflow") }
-	return newSSETee(body, onEvent, overflow, closer)
+	tee = newSSETee(body, onEvent, nil, closer)
+	return tee
 }
 
 var _ Provider = (*OpenAI)(nil)

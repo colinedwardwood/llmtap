@@ -67,7 +67,13 @@ func TestSSETeeForwardsAndParses(t *testing.T) {
 // pathological upstream that streams MiB of bytes without ever
 // emitting a `\n\n` event terminator must not OOM the proxy. Bytes
 // still forward to the client unchanged; parsing is allowed to give
-// up via a one-shot overflow signal.
+// up.
+//
+// C6 update: overflow must fire every time the buffer crosses
+// maxEventBytes, not just once. A 10 MiB no-separator payload over
+// a 1 MiB cap should produce multiple overflow signals so operators
+// can distinguish "one-off hiccup" from "sustained pathological
+// stream". Tee.Overflows() reports the total.
 func TestSSETeeBoundsBufferUnderOverflow(t *testing.T) {
 	t.Parallel()
 
@@ -88,8 +94,11 @@ func TestSSETeeBoundsBufferUnderOverflow(t *testing.T) {
 	if len(out) != len(payload) {
 		t.Errorf("forwarded %d bytes, want %d (proxy must not drop client bytes on parser overflow)", len(out), len(payload))
 	}
-	if overflows == 0 {
-		t.Error("expected onOverflow callback to fire at least once on no-separator payload")
+	if overflows < 2 {
+		t.Errorf("expected onOverflow to fire multiple times on a sustained pathological stream (C6); fired %d times", overflows)
+	}
+	if got := tee.Overflows(); got != overflows {
+		t.Errorf("Overflows() = %d, callback fired %d times; should match", got, overflows)
 	}
 }
 
