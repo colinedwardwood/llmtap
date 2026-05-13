@@ -459,10 +459,6 @@ type admission struct {
 	br *breaker
 	// sem is nil when no concurrency cap is configured.
 	sem chan struct{}
-	// breakerReleased guards against double-reporting when the enriched
-	// path's finalize() ALSO calls release() (defence in depth — today
-	// only ServeHTTP's defer calls release).
-	breakerReleased bool
 }
 
 // admit runs the breaker admit check, then the concurrency semaphore
@@ -505,11 +501,8 @@ func (h *Handler) admit(w http.ResponseWriter, upstream config.Upstream) (*admis
 }
 
 // release returns the concurrency slot to the semaphore (if any) and
-// reports the captured status code to the breaker (if any). Idempotent
-// against double-release on the breaker — the enriched path's
-// responseInterceptor used to call br.report directly; release() owns
-// that responsibility now, so double-reporting can't double-trip the
-// breaker.
+// reports the captured status code to the breaker (if any). Called
+// exactly once per admission via ServeHTTP's `defer adm.release(cw)`.
 //
 // status comes from the statusCaptureWriter that wraps w; a missing
 // status (i.e. zero) is mapped to 502 because a request that admitted
@@ -519,8 +512,7 @@ func (a *admission) release(cw *statusCaptureWriter) {
 	if a.sem != nil {
 		<-a.sem
 	}
-	if a.br != nil && !a.breakerReleased {
-		a.breakerReleased = true
+	if a.br != nil {
 		code := cw.status
 		if code == 0 {
 			code = http.StatusBadGateway
