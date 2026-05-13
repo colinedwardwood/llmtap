@@ -75,6 +75,56 @@ func TestEnvOverrides(t *testing.T) {
 	}
 }
 
+// TestEnvOverridesOTLPHeaders covers the L1 low-tier env var. Headers
+// come from container orchestrators where YAML is awkward and the
+// classic `valueFrom: secretKeyRef` path is via env.
+func TestEnvOverridesOTLPHeaders(t *testing.T) {
+	t.Setenv("LLMTAP_OTLP_HEADERS", "Authorization=Bearer abc, X-Scope-OrgID=42 , X-Tenant=acme")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	cases := map[string]string{
+		"Authorization":  "Bearer abc",
+		"X-Scope-OrgID":  "42",
+		"X-Tenant":       "acme",
+	}
+	for k, want := range cases {
+		if got := cfg.Telemetry.Headers[k]; got != want {
+			t.Errorf("Headers[%q] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestEnvOverridesSampleRatio covers the L2 low-tier env var. Includes
+// the out-of-range clamp paths the PLAN explicitly called out: don't
+// refuse startup — sampling is not a correctness knob.
+func TestEnvOverridesSampleRatio(t *testing.T) {
+	cases := []struct {
+		env  string
+		want float64
+	}{
+		{"0", 0},
+		{"0.25", 0.25},
+		{"1", 1},
+		{"1.5", 1},    // clamped down
+		{"-0.1", 0},   // clamped up
+		{"3", 1},      // clamped down
+	}
+	for _, tc := range cases {
+		t.Run(tc.env, func(t *testing.T) {
+			t.Setenv("LLMTAP_SAMPLE_RATIO", tc.env)
+			cfg, err := Load("")
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.Telemetry.SampleRatio != tc.want {
+				t.Errorf("SampleRatio = %v, want %v", cfg.Telemetry.SampleRatio, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsBadConfig(t *testing.T) {
 	t.Parallel()
 

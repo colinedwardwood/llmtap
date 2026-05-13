@@ -319,6 +319,45 @@ func applyEnv(cfg *Config) {
 			cfg.Telemetry.Insecure = b
 		}
 	}
+	if v, ok := os.LookupEnv("LLMTAP_OTLP_HEADERS"); ok {
+		// Format: "k1=v1,k2=v2". Env overrides YAML wholesale —
+		// callers who want to merge should compose at the YAML
+		// layer. Trims surrounding whitespace per-pair so the env
+		// can be hand-pasted from a shell heredoc.
+		headers := Headers{}
+		for _, pair := range strings.Split(v, ",") {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			k, val, ok := strings.Cut(pair, "=")
+			if !ok {
+				continue // malformed pair — skip silently, env never crashes
+			}
+			headers[strings.TrimSpace(k)] = strings.TrimSpace(val)
+		}
+		if len(headers) > 0 {
+			cfg.Telemetry.Headers = headers
+		}
+	}
+	if v, ok := os.LookupEnv("LLMTAP_SAMPLE_RATIO"); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			// Sampling is not a correctness knob; out-of-range
+			// values clamp rather than refuse startup. Validate's
+			// stricter check is intentionally bypassed here because
+			// env vars often come from string-typed orchestrators
+			// (helm values, terraform vars) where a typo shouldn't
+			// page someone at 3am.
+			if f < 0 {
+				fmt.Fprintf(os.Stderr, "config: LLMTAP_SAMPLE_RATIO %v < 0, clamping to 0\n", f)
+				f = 0
+			} else if f > 1 {
+				fmt.Fprintf(os.Stderr, "config: LLMTAP_SAMPLE_RATIO %v > 1, clamping to 1\n", f)
+				f = 1
+			}
+			cfg.Telemetry.SampleRatio = f
+		}
+	}
 	if v, ok := os.LookupEnv("LLMTAP_CAPTURE"); ok {
 		cfg.Content.Mode = v
 	}
