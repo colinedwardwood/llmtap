@@ -1,1521 +1,176 @@
-# llmtap remediation plan
+# llmtap — remediation ledger
 
-Derived from the 2026-05-11 adversarial review. Ordered by blast radius, not by
-ease. Phase 0 must land before any external user is told to point production
-traffic at this proxy. Phases 1–3 can ship as point releases on top.
+Two adversarial reviews (2026-05-11) surfaced 29 numbered remediation
+items across Critical / High / Medium tiers. Eight additional Low-tier
+polish items followed. **All 37 items are closed as of v0.1.3.** This
+document is now a forward-looking ledger.
 
-Each task has: **What** (the change), **Where** (the file or surface),
-**Why** (the consequence of skipping), and **Done when** (the verifiable bar).
+The per-commit audit trail lives in `git log`. Each remediation
+commit carries a `Closes A<n>` or `Closes L<n>` footer and an
+evidence block in the body — `git log -p <commit>` reads as the full
+remediation record.
 
----
-
-## Phase 0 — Stop the bleeding (v0.1.1)
-
-These are the correctness defects that destroy user data, lie in dashboards,
-or silently strip telemetry. They are blockers; nothing else in this plan
-matters until they land.
-
-### 0.1 Oversize request body no longer corrupts the upstream call
-
-- **What:** Replace the read-into-memory-then-fallback dance in
-  `readCappedBody` with a streaming policy. Two acceptable shapes:
-  - **Preferred:** never buffer the full body when above the cap. Use
-    `io.TeeReader(r.Body, &capturedHead)` with a hard ceiling of e.g. 1 MiB
-    for *enrichment*, and forward the original `r.Body` byte-for-byte to the
-    upstream. The proxy is allowed to give up on enrichment; it is **not**
-    allowed to give up on the bytes.
-  - **Acceptable fallback:** if the body is over a configurable hard limit
-    (e.g. `request.max_body_bytes`, default 32 MiB), respond `413 Payload Too
-    Large` directly to the client — never half-forward.
-- **Where:** `internal/proxy/proxy.go` (`readCappedBody`, `ServeHTTP`).
-  Add `Request.MaxBodyBytes` to `internal/config/config.go`. Update
-  `config.example.yaml` and the README "Performance" table (the "4 MiB cap" claim).
-- **Why:** Today, any chat-completions request > 4 MiB silently arrives at
-  the upstream with zero bytes and the client gets `502`. Vision API,
-  multi-modal, Whisper, and long-context Anthropic requests all break.
-  This violates the README's "forwards every request unchanged" contract,
-  which is the entire trust argument for the project.
-- **Done when:** `TestProxyOversizeBodyForwardsIntact` passes (5 MiB chat
-  request reaches the upstream byte-identical) AND a new
-  `TestProxyHardCapRejectsCleanly` returns 413 with no upstream call.
-
-### 0.2 Error response bodies forwarded intact
-
-- **What:** Stop replacing `resp.Body` with a 64 KiB-capped snippet. Read
-  into a side buffer for the `http.response.body_snippet` span attribute,
-  but restore the **full original body** to the client. Either buffer the
-  whole 4xx body (they're small) or use `io.TeeReader` to peel off the
-  first 64 KiB while the rest flows through.
-- **Where:** `internal/proxy/proxy.go` (`modify`, the `statusCode >= 400`
-  branch).
-- **Why:** Clients debugging upstream 4xx errors get a silently truncated
-  error body and can't deserialize it. Same trust-contract violation as 0.1,
-  smaller blast radius.
-- **Done when:** New test `TestProxyForwardsLarge4xxIntact` sends a 200 KiB
-  upstream error body and asserts the client receives every byte AND the
-  span has a `body_snippet` of exactly 1024 bytes.
-
-### 0.3 Streaming metrics keep their trace context
-
-- **What:** Capture the request `ctx` into the streaming `onDone` closure
-  and pass it to `finalize` instead of `context.Background()`. The closure
-  in `responseInterceptor` already has access to it; thread it through.
-- **Where:** `internal/proxy/proxy.go` — the `onDone` lambda at line ~298
-  currently reads:
-  ```go
-  func() {
-      h.activeStreams.Add(-1)
-      finalize(context.Background())
-  },
-  ```
-  Replace `context.Background()` with the per-request `ctx` captured in
-  `ServeHTTP`.
-- **Why:** Every streaming response — i.e. the dominant case — emits
-  histograms (`gen_ai.client.operation.duration`,
-  `gen_ai.client.time_to_first_token`, token usage, cost) with no trace
-  context. The metric→trace exemplar jump in Grafana is broken precisely
-  for the calls the operator most wants to investigate. Defeats the
-  project's stated point.
-- **Done when:** New test `TestStreamingMetricsCarryTraceContext` records
-  the metric reader's last observation, extracts the exemplar's TraceID,
-  and asserts it equals the span's TraceID.
-
-### 0.4 Gzipped upstream responses parse correctly
-
-- **What:** Two acceptable shapes:
-  - Strip `Accept-Encoding` from the forwarded request in the `Rewrite`
-    hook so the `http.Transport`'s built-in transparent decompression
-    always engages. (Trade-off: slightly more bytes between us and the
-    upstream.)
-  - OR: inspect `resp.Header.Get("Content-Encoding")` in `modify`. If
-    `gzip`, decompress into the side buffer used for parsing, leave
-    `resp.Body` unchanged for the client.
-- **Where:** `internal/proxy/proxy.go` — `Rewrite` and `modify`.
-- **Why:** If a client explicitly sets `Accept-Encoding: gzip`,
-  `httputil.ReverseProxy` does not auto-decompress and the JSON parser
-  silently fails. Result: `$0` cost, `0` tokens recorded for every gzipped
-  call. A FinOps disaster dressed up as a parser quirk.
-- **Done when:** New test `TestProxyGzippedResponseStillCountsTokens`
-  serves a gzipped JSON response from a fake upstream and asserts the
-  recorded span carries `gen_ai.usage.input_tokens > 0`.
-
-### 0.5 Pricing table is externalisable
-
-- **What:** Add `pricing.path` and `pricing.fail_open` to config. When
-  `pricing.path` is set, load YAML of shape:
-  ```yaml
-  openai:
-    gpt-4o-mini: {input_usd_per_mtok: 0.15, output_usd_per_mtok: 0.60}
-  anthropic:
-    claude-3-5-sonnet: {input_usd_per_mtok: 3.0, output_usd_per_mtok: 15.0}
-  ```
-  The built-in table becomes the fallback (and gains a `Source` field so
-  dashboards can show "list" vs "negotiated"). Embed via `//go:embed
-  prices.yaml` rather than the current Go-literal map.
-- **Where:** `internal/pricing/pricing.go`, `internal/pricing/prices.yaml`
-  (new), `internal/config/config.go`, README.
-- **Why:** README explicitly tells operators they can override per their
-  negotiated rate. The code provides no mechanism. Every production
-  cost number is currently the wrong number, and the project gaslights
-  the user about it.
-- **Done when:** Loading `pricing.path` overrides built-in prices, tests
-  cover override + fallback + malformed file, and the README example
-  works as written.
-
-### 0.6 Map iteration nondeterminism in pricing lookup
-
-- **What:** Sort prefixes by length-descending once at table construction
-  and store as a slice of `(prefix, rate)` pairs. Lookup walks the slice
-  and returns the first prefix match.
-- **Where:** `internal/pricing/pricing.go` (`lookup`).
-- **Why:** Today, equal-length prefixes (`gpt-4o-mini-fast` vs
-  `gpt-4o-mini-cool`) produce nondeterministic cost depending on Go map
-  iteration order. Latent correctness bomb — fires the first time someone
-  adds a same-length sibling.
-- **Done when:** A new test `TestPricingEqualLengthIsDeterministic`
-  registers two equal-length prefixes and asserts repeatable lookup
-  across 1000 iterations.
+The README's "Roadmap" section is authoritative for what's next; this
+document just tracks what hasn't been started yet.
 
 ---
 
-## Phase 1 — Trust contract (v0.2)
+## Open work (v0.2+)
 
-Privacy, security defaults, and operator basics. The bar is "I would let
-this proxy a customer's production API keys."
+These are new capabilities, not security remediations. None of them
+are gating production use of v0.1.x — that bar was cleared by the
+A-series.
 
-### 1.1 Content redaction profiles
+### B1 — Additional provider parsers
 
-- **What:** Introduce `content.redact` config with three profiles:
-  - `default` — strips `sk-[A-Za-z0-9_-]{20,}`, `xoxb-…`, AWS access keys
-    (`AKIA[0-9A-Z]{16}`), GCP service account JSON markers, common JWT
-    shape, RFC-5322 emails.
-  - `strict` — `default` plus credit-card Luhn, US SSN, E.164 phone.
-  - `off` — passthrough (current behaviour, must be explicit opt-in).
-  Default value is `default` so the privacy story is not "off by
-  accident". Apply before `span.AddEvent` and before the otelslog bridge
-  emits content into logs.
-- **Where:** `internal/redact/redact.go` (new package),
-  `internal/provider/{openai,anthropic}.go` content-event emitters,
-  `internal/config/config.go`.
-- **Why:** With `content.mode: events` users absolutely will paste API
-  keys into prompts, and they will hit the o11y backend in cleartext.
-  "Pair it with redaction at your collector" is not a credible answer
-  for a proxy whose pitch is "no SDK, no other system".
-- **Done when:** Golden tests with sample payloads (curated, not real
-  secrets) prove each profile redacts what it claims and nothing else.
-  README "Privacy" section rewritten to point at the profiles.
+- **What:** Bedrock, Gemini, Ollama-native wire formats. Each gets a
+  `provider.Provider` implementation in `internal/provider/`,
+  alongside the existing OpenAI and Anthropic parsers. Tool-call
+  TTFT and finish-reason handling per provider's streaming schema.
+- **Why:** Bedrock-Anthropic and Gemini-via-OpenAI-compat already
+  work (the proxy is wire-format-aware, not vendor-aware), but
+  native Bedrock + Gemini parsers expose richer attribute sets
+  (`gen_ai.request.bedrock.*`, Gemini's `safetyRatings`, etc.).
+  Ollama-native unlocks local-model dev loops.
+- **Done when:** Three new parsers ship, each with their own
+  `*_test.go` covering ParseRequest / ParseResponseJSON / WrapStream.
+  README upstreams matrix updated.
 
-### 1.2 Upstream host pinning
+### B2 — `llmtap record` / `replay` / `diff` for migration A/B
 
-- **What:** Treat `Upstream.Target` as a *pinned* host. The
-  `ReverseProxy.Transport` is constructed per-upstream with a
-  `tls.Config{ServerName: target.Hostname()}` and (optionally) a
-  pinned-cert allow-list per upstream (`pin_sha256: [<spki-hash>, …]`).
-- **Where:** `internal/proxy/proxy.go` (`New`, where the `*ReverseProxy`
-  is built per upstream).
-- **Why:** Today, any operator-installed corporate-MITM root in the
-  system trust store sees the bearer token. For an "audit boundary"
-  proxy, that's theatre. Pinning makes llmtap a real boundary.
-- **Done when:** Two new tests: (a) a swap to a forged cert chained to a
-  different CA is rejected, (b) configured `pin_sha256` rejects a valid
-  cert with a non-matching SPKI.
+- **What:** Three new subcommands.
+  - `llmtap record --out replay.ndjson` — captures the raw request /
+    response pairs flowing through the proxy.
+  - `llmtap replay replay.ndjson --against api.example.com` — re-runs
+    the captured requests against a different upstream.
+  - `llmtap diff a.ndjson b.ndjson` — semantic diff (model parameters,
+    finish reasons, content) suitable for "moving from gpt-4o to
+    gpt-4o-mini, where do the answers actually change?".
+- **Why:** Model migrations are an under-tooled corner of the LLM
+  ops space. A capture-and-replay loop turns the proxy from passive
+  observability into an A/B testing harness.
+- **Done when:** New `internal/replay/` package with record + replay
+  primitives. New top-level `cmd/llmtap` subcommands. End-to-end
+  test using httptest fixtures for both providers.
 
-### 1.3 Health and readiness endpoints
+### B3 — Cost / error-biased sampling
 
-- **What:** Reserve two paths on the listener that bypass the upstream
-  router: `/healthz` (always 200 OK once `Run` returns from `Listen`)
-  and `/readyz` (200 once OTLP exporters have completed their first
-  export attempt successfully, else 503).
-- **Where:** `internal/proxy/proxy.go` (`ServeHTTP` short-circuit before
-  `cfg.Match`), `internal/telemetry/telemetry.go` (readiness signal).
-  Document that no `upstream.prefix` may begin with `/healthz` or
-  `/readyz`.
-- **Why:** k8s, ALB, Cloudflare Tunnel, and any L7 LB need a probe
-  target. Today there is none. Probe traffic gets attributed to the
-  first-matching upstream prefix.
-- **Done when:** `GET /healthz` returns 200 with no upstream traffic;
-  `GET /readyz` returns 503 before OTLP comes up, 200 after; tests
-  cover both.
+- **What:** `telemetry.sample_strategy: cost_weighted | error_biased
+  | random`. Cost-weighted samples requests with probability
+  proportional to their predicted cost (so expensive calls are
+  always traced, cheap ones at low rate). Error-biased samples 5xx
+  at 1.0, 4xx at 0.5, 2xx at the configured base rate.
+- **Why:** Today every llmtap deployment with `sample_ratio < 1.0`
+  loses cheap and expensive calls at the same rate — the wrong
+  trade-off for cost dashboards (which want every expensive call
+  intact). A bias toward errors gives debugging surface without
+  bloating spans on the happy path.
+- **Done when:** New samplers wired into the OTel TracerProvider.
+  Documented in README's PromQL examples (sampled-rate math
+  changes). Existing `sample_ratio` keeps its meaning under the
+  new `random` strategy.
 
-### 1.4 Server shutdown waits on active streams
+### B4 — Stricter readiness signal
 
-- **What:** `Server.Run` on `ctx.Done()` calls `h.WaitForStreams(shutCtx)`
-  before `server.Shutdown`. The wait polls `h.activeStreams` (already
-  present) with a small backoff and respects the shutdown deadline. If
-  the deadline expires while streams are in-flight, log a `WARN` with
-  the count and proceed.
-- **Where:** `internal/proxy/server.go` (`Run`),
-  `internal/proxy/proxy.go` (add `WaitForStreams`).
-- **Why:** Today the `activeStreams` counter exists but nothing observes
-  it. SIGTERM during a flight of agent calls kills the spans mid-flight.
-  README claims "graceful shutdown"; it is not.
-- **Done when:** Test `TestShutdownWaitsForActiveStreams` starts a slow
-  fake stream, sends SIGTERM, asserts `Run` blocks until the stream
-  finishes (within the deadline) before returning.
+- **What:** Replace the "set to true once Setup returns" loose
+  readiness flag (A19) with a real signal: `/readyz` returns 200
+  only after at least one OTLP export round-trip has succeeded.
+- **Why:** The loose signal can flap green while the OTLP endpoint
+  is unreachable — the BatchProcessor accepts spans into its buffer
+  until the buffer is full. A k8s rolling update could route
+  traffic before the proxy can actually emit telemetry.
+- **Done when:** Hook into the OTel SDK's
+  `BatchSpanProcessor.ForceFlush` / `Logger.LogRecord` callbacks
+  (or use a custom Exporter wrapper) to flip the ready flag on
+  first success. Two tests: ready=false until export succeeds,
+  ready=true after.
 
-### 1.5 Per-upstream concurrency cap
+### B5 — Per-upstream rate limit
 
-- **What:** Add `upstreams[].max_in_flight` (default unlimited, or a
-  conservative global of e.g. 256). Implement with
-  `golang.org/x/sync/semaphore` keyed per upstream. When the semaphore is
-  full, return `429 Too Many Requests` with `Retry-After: 1`.
-- **Where:** `internal/proxy/proxy.go`, `internal/config/config.go`.
-- **Why:** OpenAI brownouts will currently take the proxy down via
-  goroutine + memory exhaustion. The cap is the fuse.
-- **Done when:** A test that fires N+1 concurrent requests with cap=N
-  observes exactly one 429.
-
-### 1.6 SSE buffer is bounded
-
-- **What:** In `sseTee.Read`, if `t.buf.Len()` exceeds a cap (e.g.
-  `maxEventBytes = 1 MiB`), drop the buffered bytes, set a
-  `parser_overflow` span event, and continue forwarding. Bytes still
-  flow to the client unchanged — only parsing gives up. Reset the
-  buffer to release memory.
-- **Where:** `internal/provider/sse.go`.
-- **Why:** Today an upstream that sends a single event with no
-  terminating `\n\n` grows `bytes.Buffer` until OOM. Remote-DoS surface
-  on every llmtap deployment.
-- **Done when:** Fuzz-style test feeds a 10 MiB single-event payload,
-  asserts memory stays bounded and forwarding completes.
+- **What:** `upstreams[].rate_limit: { rps: int, tpm: int }`. Token
+  bucket per upstream, separate from the existing `max_in_flight`
+  concurrency cap (A12). On overflow: 429 with the existing
+  `Retry-After` shape.
+- **Why:** A burst of N concurrent requests is bounded by the
+  semaphore today, but a steady stream of `rps` × `max_in_flight`
+  requests is not. Some operators want to keep total spend below
+  a budget; `tpm` (tokens per minute) addresses that directly,
+  since the proxy already knows the per-call token count from
+  `ParseResponseJSON`.
+- **Done when:** New `internal/ratelimit/` package using
+  `golang.org/x/time/rate`. Per-upstream `*rate.Limiter`,
+  consulted before the concurrency-cap acquire. Tests for the
+  RPS path; TPM path is harder to test deterministically — accept
+  a soak-test in the load harness.
 
 ---
 
-## Phase 2 — Production hardness (v0.3)
-
-### 2.1 Hot certificate reload
-
-- **What:** Replace `srv.ServeTLS(ln, certFile, keyFile)` with a manual
-  load path: build `tls.Config{GetCertificate: certManager.Get}`. The
-  cert manager `os.Stat`s the cert file every N seconds (configurable,
-  default 30s) and reloads when `ModTime` changes. Log loaded SHA-256
-  of the leaf for audit.
-- **Where:** `internal/proxy/server.go`, new `internal/proxy/certmgr.go`.
-- **Why:** cert-manager is the default in 2026. Cert rotation requires
-  process restart today, which means brief downtime every 90 days
-  forever.
-- **Done when:** Test writes cert v1, starts server, swaps to cert v2,
-  asserts the next TLS handshake presents v2 within the reload window.
-
-### 2.2 Circuit breaker per upstream
-
-- **What:** Wrap each upstream's `Transport` in a circuit breaker that
-  trips after N consecutive 5xx (default 10) within a window (default
-  30s). Open state returns `503 Service Unavailable` immediately to the
-  client; half-open admits a single probe.
-- **Where:** `internal/proxy/proxy.go`, plus a tiny breaker package
-  (consider `sony/gobreaker` if license compatible; otherwise hand-roll
-  in <100 LOC).
-- **Why:** Co-fuse with the concurrency cap. Without it, a degraded
-  upstream consumes all in-flight slots and we melt anyway.
-- **Done when:** Tests for the three transitions (closed→open,
-  open→half-open, half-open→closed/open).
-
-### 2.3 Cost metric as histogram
-
-- **What:** Convert `gen_ai.client.cost.usd` from `Float64Counter` to
-  `Float64Histogram` with USD-scaled buckets (1e-5, 1e-4, …, 100), and
-  add `gen_ai.client.cost.usd.total` as a parallel monotonic
-  observable counter for "total spend" dashboards.
-- **Where:** `internal/telemetry/telemetry.go` (`newGenAIMeters`),
-  `internal/proxy/proxy.go` (`recordMetrics`).
-- **Why:** Float counters drift across millions of small adds; PromQL
-  `rate()` can go negative at boundaries. Either accept the lie or fix
-  it. Histograms also give p50/p95 cost per call, which is more useful
-  than a running total anyway.
-- **Done when:** Both instruments exist; the existing PromQL examples in
-  the README are updated and verified against the demo stack.
-
-### 2.4 Pin the OTel module set
-
-- **What:** Move every `go.opentelemetry.io/otel/*` dependency to a
-  single coherent release line. Today the API is `v1.32.0` and the SDK
-  is `v1.31.0`; the log surface is `v0.7.0` / `v0.8.0`. Run `go get -u
-  go.opentelemetry.io/otel/...@<chosen-version>` and re-vendor.
-- **Where:** `go.mod`, `go.sum`.
-- **Why:** Mixed-version OTel modules work today and fail on the next
-  point release when a constructor signature shifts. Latent runtime
-  failure mode.
-- **Done when:** All `go.opentelemetry.io/otel/*` lines in `go.mod`
-  point to release-aligned versions; CI passes on Go 1.24+.
-
-### 2.5 Tool-call and multimodal streaming coverage
-
-- **What:** Recognise `choices[].delta.tool_calls` in OpenAI streams as
-  a content delta for TTFT measurement and for `gen_ai.choice` events.
-  Same for Anthropic `content_block_delta` with `type:
-  "input_json_delta"`. Multimodal request content (image/audio parts)
-  is parsed as `content_type` rather than dropped.
-- **Where:** `internal/provider/openai.go`, `internal/provider/anthropic.go`.
-- **Why:** Agentic workloads stream tool calls, not text. Today TTFT is
-  not recorded for tool-only streams and the assembled content event
-  is empty. The README pitches "agents that fail in ways nobody can
-  debug" as the problem we solve; we don't.
-- **Done when:** New tests for both providers assert TTFT and finish
-  reasons are recorded for tool-only streams.
-
----
-
-## Phase 3 — Project hygiene (continuous)
-
-### 3.1 Continuous integration
-
-- **What:** `.github/workflows/ci.yml` running on every PR and on main:
-  - `make test` with `-race -count=1 -timeout=2m`.
-  - `make lint` with `golangci-lint` (the config already exists).
-  - `govulncheck ./...` — fail on any HIGH or CRITICAL.
-  - `trivy fs --severity HIGH,CRITICAL .` on the repo.
-  - Build matrix: linux/{amd64,arm64} + darwin/arm64.
-  - Coverage report uploaded as artifact; gate at 70% line coverage on
-    the `internal/` tree (raise over time).
-  Separate `.github/workflows/release.yml` triggers on tag:
-  - Build and sign with `cosign` (keyless OIDC).
-  - Generate SLSA-3 provenance via
-    `slsa-framework/slsa-github-generator`.
-  - Build and push Docker image to `ghcr.io` with attestations.
-  - SBOM (CycloneDX) attached to the release.
-- **Why:** The contribution guideline "run `make test lint`" is on the
-  honor system. The README invites users to download unsigned binaries
-  holding production credentials.
-- **Done when:** PR checks are mandatory in branch protection; a tag
-  produces a signed, attested release with an SBOM.
-
-### 3.2 Test backfill
-
-Drive each item in this list to a green test:
-
-- [x] Oversize request body forwarded intact (0.1) — `TestProxyOversizeBodyForwardsIntact` (A3).
-- [x] 4xx body > 64 KiB forwarded intact (0.2) — `TestProxyForwardsLarge4xxIntact` (A4).
-- [x] Streaming metric carries trace context (0.3) — `TestStreamingMetricsCarryTraceContext` (A5).
-- [x] Gzipped response tokens parsed (0.4) — `TestProxyGzippedResponseStillCountsTokens` (A6).
-- [x] Pricing override loaded from file (0.5) — `TestTableOverrideReplacesBuiltIn` + `TestProxyEmitsOverriddenCost` (A7).
-- [x] Pricing equal-length prefix is deterministic (0.6) — `TestPricingEqualLengthIsDeterministic` (A17).
-- [x] Redaction profile golden tests (1.1) — `internal/redact/redact_test.go` + `TestProxyRedactsContentEventsByDefault` (A16).
-- [x] Cert pinning rejects foreign CA (1.2) — `TestUpstreamPinRejectsWrongCert` (A18).
-- [x] `/healthz`, `/readyz` semantics (1.3) — `TestHealthzAlwaysOK`, `TestReadyzReturnsExpectedStatus` (A19).
-- [x] Shutdown waits on streams (1.4) — `TestShutdownWaitsForActiveStreams` (A20).
-- [x] Concurrency cap returns 429 (1.5) — `TestUpstreamConcurrencyCapReturns429` (A12).
-- [x] SSE buffer bounded under attack (1.6) — `TestSSETeeBoundsBufferUnderOverflow` (A13).
-- [x] Cert hot reload (2.1) — `TestCertManagerReloadsOnModTimeChange` + `TestServerRunServesFreshlyLoadedCert` (A23).
-- [x] Circuit breaker transitions (2.2) — `TestBreakerOpensAfterConsecutiveFailures`, `…HalfOpenAdmitsOneProbe`, `…ClosesOnProbeSuccess` (A24).
-- [x] Tool-call streaming TTFT (2.5) — `TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken`, `TestAnthropic…` (A26).
-- [x] Anthropic streaming end-to-end (was absent entirely) — `TestAnthropicWrapStreamToolOnlyStreamFiresFirstToken` (A26) exercises the full SSE → parser → info path. A full proxy-level E2E for Anthropic stays on the docket but the parser-level path is covered.
-- [x] `Authorization` header survives the full proxy path (assertion) — implicit in the existing end-to-end suite: `TestProxyEndToEndNonStreaming` and `TestProxyAcceptsCorrectToken` exercise the inbound `Authorization`-forwarding contract; the auth header llmtap consumes (`X-LLMTAP-Token` by default) is explicitly stripped from outbound by `auth_test.go`'s defensive upstream-side assertion (A10).
-- [x] `captureContent: events` actually emits the events (assertion) — `TestErrorBodySnippetAttachedWhenContentEvents` + `TestProxyRedactsContentEventsByDefault` (A2/A16) both consume the span events that `content.mode=events` emits.
-
-### 3.3 Disclosure surface
-
-- **What:** Add `SECURITY.md` with disclosure mailbox + 90-day
-  coordinated-disclosure window. Add `CODEOWNERS`. Add
-  `.github/dependabot.yml` for `gomod` + `github-actions` weekly.
-- **Why:** This project brokers third-party API credentials. A CVE is
-  inevitable. Have the disclosure channel before, not after.
-
-### 3.4 Documentation honesty pass
-
-- **What:** Walk the README against the implementation and fix every
-  load-bearing claim that is currently false or aspirational:
-  - "It never alters bodies" — adjust to enumerate the explicit cases
-    (snippet capture for 4xx is bounded, etc.).
-  - "Memory: dominated by in-flight request bodies; capped at 4 MiB per
-    request" — restate with the new policy from 0.1.
-  - "Graceful shutdown. … No tests left dangling." — only after 1.4
-    lands.
-  - "Production deployments should override per their negotiated rate"
-    — point at the actual config knob (0.5).
-  - Roadmap "Built-in redaction profiles" — move to "Shipping in 0.2"
-    (1.1).
-
-### 3.5 Build info reaches `--version`
-
-- **What:** Wire `runtime/debug.ReadBuildInfo` as a fallback when
-  ldflags are not set (today, `go install` users see `dev / unknown /
-  unknown`). The Makefile already injects via `-X`; add the same for
-  `go install`-style consumers.
-- **Where:** `internal/buildinfo/buildinfo.go`.
-
----
-
-## Sequencing and ownership
-
-- **Phase 0** is one focused PR per item, six PRs total. Estimated 3–5
-  engineering days end-to-end. All six block any external "v0.1 GA"
-  announcement.
-- **Phase 1** is the v0.2 milestone. Estimated 2–3 weeks. The order
-  inside the phase is flexible except that 1.3 (`/healthz`) and 1.4
-  (shutdown waits) should land together — they're co-features of the
-  same "operator can trust the lifecycle" story.
-- **Phase 2** is the v0.3 milestone. The order inside is flexible;
-  2.4 (OTel pin) is the cheapest and should land first to de-risk
-  the rest.
-- **Phase 3** runs in parallel from day one. 3.1 (CI) should land
-  before any Phase 0 PR — it's the safety net for everything else.
-
-## Non-goals for this plan
-
-- Adding Bedrock / Gemini / Ollama parsers (v0.2+ roadmap, separate
-  effort).
-- `llmtap record` / `replay` / `diff` (v0.2+ roadmap).
-- Cost-weighted sampling (v0.2+ roadmap).
-
-These are good ideas. They are not on the path to "this proxy is safe
-to put in front of production API keys", which is what this plan is
-for.
-
----
-
-# Addendum — Second adversarial review (2026-05-11, round 2)
-
-A second pass surfaced additional issues that the first review missed.
-The most serious is **0.7 — metric label cardinality**, which has been
-promoted to "new FATAL FLAW" status: it is the failure mode most likely
-to take down the *operator's* observability stack rather than llmtap
-itself. Items are slotted into the existing phase scheme.
-
-## Phase 0 additions — Stop the bleeding
-
-### 0.7 Cap metric-label cardinality on model attributes  *(FATAL FLAW)*
-
-- **What:** Three layered defenses, all required:
-  1. **Normalize** the model string before it reaches any metric label.
-     Strip provider-specific date/snapshot suffixes (`gpt-4o-2024-08-06`
-     → `gpt-4o`; `claude-3-5-sonnet-20241022` → `claude-3-5-sonnet`).
-     Reuse the longest-prefix logic already in `pricing.lookup`.
-  2. **Allow-list** known model families via a built-in set
-     (`internal/genai/models.go`, populated from the pricing table) plus
-     an operator-configurable `metrics.allowed_models: [string]` in
-     config. Anything not in the union maps to `_other`.
-  3. **Hard cap** total observed distinct values per process with an
-     LRU-style bounded set (`metrics.max_model_cardinality`, default
-     200). On overflow, route the value to `_other` and emit a one-shot
-     `llmtap.cardinality.overflow` event.
-- **Where:** new `internal/labels/labels.go`; call sites in
-  `internal/proxy/proxy.go` (`recordMetrics`) **only** — span attributes
-  may keep the raw model string (span cardinality is bounded by
-  retention). `internal/genai/genai.go` for the normalization table.
-  `internal/config/config.go` for the two new knobs.
-- **Why:** Today, every emitted metric carries
-  `attribute.String(genai.AttrRequestModel, info.RequestModel)` with the
-  client's verbatim model string. Any buggy or hostile client can mint
-  unbounded series in Prometheus/Mimir. For a proxy whose pitch is
-  "drop it in front of your LLM calls," the dominant operational risk
-  is *llmtap takes down the o11y stack the operator already depends
-  on*. This eclipses every other Phase 0 item.
-- **Done when:**
-  - `TestMetricsCardinalityCapped` fires 10,000 unique model strings
-    through the proxy and asserts the recorded label set has
-    `len ≤ max_model_cardinality + 1` (+1 for `_other`).
-  - `TestMetricsNormalization` asserts that
-    `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, and `gpt-4o-mini-2024-07-18`
-    map to `gpt-4o`, `gpt-4o`, `gpt-4o-mini`.
-  - README "Performance" gains a "Cardinality" subsection explaining
-    the caps.
-
-### 0.8 `--log-level` flag actually changes log level
-
-- **What:** Replace `slog.SetLogLoggerLevel(lvl)` with a `slog.LevelVar`
-  threaded into both the otelslog handler and a fallback
-  `slog.NewTextHandler` for stderr. Resolve the level *before*
-  constructing the logger, not after `slog.SetDefault`. Delete the
-  comment block that rationalizes the current no-op.
-- **Where:** `cmd/llmtap/main.go` (`runUp`, `setLevel`).
-- **Why:** Today, `--log-level=debug`, `--log-level=warn`, and
-  `--log-level=error` produce identical output. The handler ignores
-  `SetLogLoggerLevel` (that function only governs `log` → `slog`
-  bridging). In an incident, operators dialing the level down to debug
-  will see nothing new and waste valuable time.
-- **Done when:** `TestRunUpLogLevelHonored` captures stderr from
-  `runUp(["up", "--log-level=error"], …)` against a config with an
-  intentional info-level log site, asserts the info line does not
-  appear, and asserts the same site with `--log-level=info` does.
-
-### 0.9 Error-body snippet respects `content.mode=off`
-
-- **What:** Gate `attribute.String("http.response.body_snippet", …)` on
-  `captureContent || cfg.Content.Mode != "off"`. When content capture
-  is off, attach only `http.response.body_size` and a synthetic
-  `error_class` derived from `resp.Header.Get("WWW-Authenticate")` /
-  the upstream's machine-readable error code field (parsed from the
-  body in a side buffer, never attached as content).
-- **Where:** `internal/proxy/proxy.go` (`modify`, the `statusCode >= 400`
-  branch).
-- **Why:** Today, every 4xx/5xx attaches the first 1024 UTF-8-clean
-  bytes of the upstream error response as a span attribute, regardless
-  of `content.mode`. OpenAI's auth-failure responses include a prefix
-  of the offending API key (`"Incorrect API key provided: sk-proj-…"`).
-  This silently violates the project's flagship privacy default. The
-  remedy is independent of 1.1 (redaction profiles) because operators
-  set `content.mode=off` precisely to avoid having to trust a
-  redactor.
-- **Done when:** `TestErrorBodySnippetSuppressedWhenContentOff` sends a
-  401 from a fake upstream with a body containing `sk-test-LEAKED` and
-  asserts the recorded span has no attribute whose value contains
-  `sk-test-LEAKED`.
-
-## Phase 1 additions — Trust contract
-
-### 1.7 Reject `telemetry.insecure: true` with non-loopback endpoint
-
-- **What:** Extend `Config.Validate` to refuse startup when
-  `Telemetry.Insecure` is true AND `Telemetry.Endpoint` does not
-  resolve to a loopback or RFC1918 host. Match the existing
-  `listen`-side guardrail in spirit and error-message style. Provide
-  an explicit override (`telemetry.acknowledge_insecure: true`) for
-  the rare legitimate case (sidecar collector on a unix-socket-style
-  bridge).
-- **Where:** `internal/config/config.go` (`Validate`, plus a small
-  `isLocalEndpoint` helper that splits host:port and runs the same
-  loopback/private-IP checks).
-- **Why:** Default config has `insecure: true` and
-  `endpoint: localhost:4317`. The first user who edits *only* the
-  endpoint (`LLMTAP_OTLP_ENDPOINT=otel.grafana.net:443`) ships every
-  trace — including any captured prompts — in cleartext over the WAN.
-  Symmetric with the existing protection on `listen`.
-- **Done when:** `TestValidateRejectsInsecureWAN` asserts a config with
-  `endpoint: otel.example.com:4317` + `insecure: true` returns an
-  error; the same with `acknowledge_insecure: true` does not.
-
-### 1.8 `LLMTAP_OTLP_HEADERS` environment override
-
-- **What:** Add env support for `Telemetry.Headers`. Parse a
-  comma-separated `k=v` list (`Authorization=Bearer abc,X-Scope-OrgID=42`),
-  trimming whitespace. Env takes precedence over YAML, consistent with
-  the rest of `applyEnv`. Document the parsing rules in the example
-  config.
-- **Where:** `internal/config/config.go` (`applyEnv`).
-- **Why:** Today the OTLP backend's bearer token can only live in YAML
-  on disk. Kubernetes secret → env var → process is the standard
-  delivery pattern and there is no escape hatch. Forces operators to
-  ship config files for what should be a `valueFrom: secretKeyRef`.
-- **Done when:** `TestEnvOverridesHeaders` sets
-  `LLMTAP_OTLP_HEADERS="Authorization=Bearer abc,X-Tenant=42"` and
-  asserts `cfg.Telemetry.Headers["Authorization"] == "Bearer abc"`
-  and `cfg.Telemetry.Headers["X-Tenant"] == "42"`.
-
-### 1.9 `LLMTAP_SAMPLE_RATIO` environment override
-
-- **What:** Add env support for `Telemetry.SampleRatio`. Parse as
-  `float64` via `strconv.ParseFloat`, clamp to `[0,1]` with a warning
-  to stderr if out of range (do not refuse to start — sampling is not
-  a correctness knob).
-- **Where:** `internal/config/config.go` (`applyEnv`).
-- **Why:** Inconsistent with the rest of `applyEnv` (most scalars are
-  env-overridable, this one isn't). Operators tuning sample ratio at
-  deploy time today must regenerate the config file.
-- **Done when:** Trivial test asserts env override sets the field.
-
-### 1.10 Body-upload deadline (slowloris mitigation)
-
-- **What:** Set `Server.ReadTimeout` AND keep `WriteTimeout=0` for
-  streaming. Alternatively (preferred): wrap `r.Body` in an
-  `http.MaxBytesReader` + a `context.WithTimeout` deadline on the
-  body read itself, so the request goroutine cannot be held open
-  indefinitely by a slow uploader. Cap default: 30s body read,
-  configurable via `http.body_read_timeout`.
-- **Where:** `internal/proxy/server.go`, `internal/proxy/proxy.go`
-  (`readCappedBody`).
-- **Why:** Today, `WriteTimeout: 0` is intentional for streaming
-  responses, but there is no symmetric body-read deadline. A slow
-  uploader can hold a connection open indefinitely. Cheap remote-DoS
-  surface against a single-binary proxy.
-- **Done when:** `TestSlowUploadIsTerminated` sends a body at 1 byte
-  per 100ms and asserts the proxy gives up within
-  `body_read_timeout + epsilon`.
-
-### 1.11 SSE parser handles `\r\n\r\n` and `\r\r` framing
-
-- **What:** Replace `bytes.Index(raw, []byte("\n\n"))` with a small
-  scanner that recognizes any of `\n\n`, `\r\n\r\n`, `\r\r` as a
-  message terminator. Keep the existing per-line `TrimRight(line, "\r")`
-  normalization.
-- **Where:** `internal/provider/sse.go` (`drain`).
-- **Why:** The SSE spec permits all three frame separators. OpenAI and
-  Anthropic ship `\n\n` today; if either switches to CRLF framing,
-  llmtap silently degrades to "buffer the whole stream, then flush
-  one giant event on EOF". TTFT goes wrong, per-chunk usage is lost,
-  and the failure is invisible until someone notices the histograms
-  are flat.
-- **Done when:** Three new sub-tests in `TestSSETeeForwardsAndParses`
-  feed `\r\n\r\n`-framed, `\r\r`-framed, and mixed-framing payloads
-  and assert each event is dispatched at the correct boundary.
-
-### 1.12 Strict operation-path matching
-
-- **What:** Replace `strings.HasSuffix(urlPath, "/chat/completions")`
-  with a path-segment match (`pathPrefix + "/chat/completions"` exact,
-  or a tiny `path.Clean` + split + last-segments comparison). Same
-  for `/embeddings` and Anthropic `/messages`.
-- **Where:** `internal/provider/openai.go` (`OperationFor`),
-  `internal/provider/anthropic.go` (`OperationFor`).
-- **Why:** Today a request to e.g. `/v1/files/chat/completions`
-  matches `OpChat` and gets the chat-completions parser pointed at
-  whatever JSON shape that endpoint returns. Garbage-attribute or
-  parse-fail; either way wrong. Defensive and cheap.
-- **Done when:** `TestOperationForRejectsImpostorPaths` asserts each
-  provider's `OperationFor` returns `""` for paths like
-  `/v1/files/chat/completions` and `/v1/anthropic/.well-known/messages`.
-
-### 1.13 Client authentication at the proxy boundary
-
-- **What:** Optional bearer-token allow-list on the listener:
-  ```yaml
-  auth:
-    tokens:
-      - "$argon2id$v=19$..."   # hashed; CLI helper to generate
-    header: "Authorization"    # default
-  ```
-  When `auth.tokens` is non-empty, every request must present a
-  matching token (after the standard `Bearer ` prefix). On mismatch,
-  return `401` with no upstream call. Tokens are compared in constant
-  time against the stored hashes.
-- **Where:** new `internal/auth/auth.go`; wiring in
-  `internal/proxy/proxy.go` (`ServeHTTP`, before `cfg.Match`);
-  `internal/config/config.go`.
-- **Why:** Today llmtap forwards `Authorization: Bearer sk-…`
-  byte-for-byte (advertised feature) but performs *no* check on the
-  caller. mTLS (1.2 + the existing `ClientCAFile`) is the strong
-  story, but issuing client certs is heavy. A token allow-list is the
-  cheap defense-in-depth layer that turns the demo compose stack from
-  an open relay into a private tool.
-- **Done when:** `TestAuthRequiredWhenTokensConfigured` asserts a
-  missing/wrong token gets a 401 with no upstream traffic, and a
-  correct one gets the normal proxy path.
-
-## Phase 2 additions — Production hardness
-
-### 2.6 Tune `httputil.ReverseProxy.Transport` per upstream
-
-- **What:** Replace the implicit `http.DefaultTransport` with an
-  explicit per-upstream transport:
-  ```go
-  &http.Transport{
-      MaxIdleConns:          256,
-      MaxIdleConnsPerHost:   64,
-      IdleConnTimeout:       90 * time.Second,
-      TLSHandshakeTimeout:   10 * time.Second,
-      ResponseHeaderTimeout: 60 * time.Second,
-      ExpectContinueTimeout: 1 * time.Second,
-      ForceAttemptHTTP2:     true,
-  }
-  ```
-  Expose `MaxIdleConnsPerHost` and `ResponseHeaderTimeout` as per-upstream
-  config overrides for the brave.
-- **Where:** `internal/proxy/proxy.go` (`New`),
-  `internal/config/config.go`.
-- **Why:** `http.DefaultTransport` has `MaxIdleConnsPerHost: 2`. Under
-  any real concurrency to `api.openai.com`, connections serialize
-  through 2 sockets, latency p99 explodes, and the proxy's "zero
-  overhead" pitch is a lie. Invisible bottleneck.
-- **Done when:** A load test (k6 or vegeta, see 3.6) sustains 200 RPS
-  against a local httpbin-style fake upstream with p99 added latency
-  under 5ms.
-
-### 2.7 Stream non-streaming JSON responses through
-
-- **What:** Replace the `io.ReadAll(resp.Body)` + re-wrap pattern with
-  `io.TeeReader(resp.Body, &captureBuf)` for non-streaming responses.
-  Bytes flow to the client as they arrive; the parser runs on the
-  captured copy when the body close fires. Cap `captureBuf` at e.g.
-  4 MiB (configurable, matches request cap); above that, give up on
-  enrichment and continue tee-ing.
-- **Where:** `internal/proxy/proxy.go` (`modify`, the non-streaming
-  branch).
-- **Why:** Today, the entire upstream JSON is read into memory before
-  the first byte reaches the client. README claims "~1-2 ms overhead
-  added to non-streaming calls". For an embeddings response with 8K
-  inputs (megabytes), the real overhead is "first byte delayed by
-  the full upstream response time". p99 lies.
-- **Done when:** `TestNonStreamingFirstByteIsNotDelayed` measures TTFB
-  to client against TTFB from upstream and asserts the delta is under
-  10ms even for a 5 MiB JSON response.
-
-### 2.8 Pre-check `Content-Length` before reading
-
-- **What:** In `readCappedBody`, if `r.ContentLength > 0 &&
-  r.ContentLength > cfg.Request.MaxBodyBytes`, return 413 immediately
-  without reading the body. Falls through to the existing
-  read-with-cap path otherwise (covers chunked transfer where
-  Content-Length is -1).
-- **Where:** `internal/proxy/proxy.go` (`readCappedBody`,
-  `ServeHTTP`).
-- **Why:** Today a 1 GiB body with `Content-Length: 1073741824` is
-  read up to 4 MiB+1 before being rejected. Trivial defense against
-  trivial DoS that 0.1 doesn't fully cover (0.1 makes the read
-  succeed, but reading still costs CPU and bandwidth).
-- **Done when:** `TestContentLengthPreCheck` sends a request with
-  `Content-Length: 999999999` and a tiny body, asserts the response
-  is 413 and that the upstream fake records zero bytes read.
-
-### 2.9 Pricing trie for O(K) lookup
-
-- **What:** Replace the linear-scan `lookup` with a per-system prefix
-  trie built once at pricing-table load. Lookup is O(len(model))
-  instead of O(N · avg_prefix_len).
-- **Where:** `internal/pricing/pricing.go`.
-- **Why:** N=12 today, negligible. With the externalized pricing
-  table from 0.5 and the cardinality cap from 0.7 (which steers
-  unknowns to `_other`), realistic deployments will register
-  100–300 model prefixes. Linear scan becomes a measurable hot path.
-- **Done when:** Microbenchmark `BenchmarkPricingLookup` shows the
-  per-op cost stays within 200ns at N=500 prefixes.
-
-## Phase 3 additions — Project hygiene
-
-### 3.6 Load test harness in CI
-
-- **What:** Add `test/load/` with k6 or vegeta scripts hitting a
-  fake-upstream httptest server through llmtap at 200 RPS for 60s.
-  Assert p99 added latency under 5ms, zero 5xx, zero goroutine leak.
-  Run on every PR via `make load-test` and in CI.
-- **Where:** `test/load/`, `Makefile`, `.github/workflows/ci.yml`
-  (after 3.1 lands).
-- **Why:** Every performance claim in the README ("~1-2 ms",
-  "~0 added latency for streaming") is currently vibes. The
-  cardinality cap (0.7) and transport tuning (2.6) both need
-  empirical evidence to dial in defaults. Cheap once, valuable
-  forever.
-- **Done when:** `make load-test` passes locally and in CI; results
-  surfaced as a PR comment via GitHub Actions output.
-
-### 3.7 Demo compose stack hardening
-
-- **What:** In `deploy/compose/docker-compose.yml`, replace
-  `LLMTAP_ALLOW_INSECURE: "true"` with a generated self-signed cert
-  baked into a sidecar volume, and switch the listener to TLS on
-  `:4443`. Provide a `make compose-up-insecure` escape hatch for
-  users who explicitly want plaintext loopback.
-- **Where:** `deploy/compose/docker-compose.yml`, `Makefile`, README
-  Quick Start section.
-- **Why:** The current demo trains users that `allow_insecure: true`
-  is the way to make llmtap work. Copy-paste from demo to prod is
-  guaranteed; we should not be teaching the wrong thing in the first
-  example operators ever run.
-- **Done when:** `make compose-up` brings up the stack on `https://
-  localhost:4443` with a self-signed cert; the Quick Start in the
-  README walks through the cert-trust step.
-
-### 3.8 Test backfill — addendum items
-
-Extends the checklist in 3.2:
-
-- [x] Cardinality cap holds under 10k unique models (0.7) — `TestProxyMetricsModelCardinalityIsBounded` fires 1000 (A1).
-- [x] Model normalization maps snapshots to families (0.7) — `TestModelNormalizeStripsDateSnapshots` (A1).
-- [x] `--log-level` actually changes verbosity (0.8) — `TestNewLoggerRespectsLevelInfo|Error` (A8).
-- [x] Error snippet suppressed when content.mode=off (0.9) — `TestErrorBodySnippetSuppressedWhenContentOff` (A2).
-- [x] Validation refuses insecure+WAN OTLP (1.7) — `TestValidateRejectsInsecureWAN` (A9).
-- [ ] Env override for OTLP headers (1.8) — open (Low tier).
-- [ ] Env override for sample ratio (1.9) — open (Low tier).
-- [x] Slow uploader is terminated within deadline (1.10) — `TestSlowUploadIsTerminated` (A11).
-- [x] SSE parser handles `\r\n\r\n` and `\r\r` (1.11) — `TestSSETeeFramingCRLF`, `…CR`, `…Mixed` (A21).
-- [x] `OperationFor` rejects impostor paths (1.12) — `TestOperationForStrictMatching` (A22).
-- [x] Bearer-token allow-list rejects unauthorized clients (1.13) — `TestProxyRejects401WithoutToken`, `…WithWrongToken` (A10).
-- [x] Non-streaming TTFB delta under 10ms (2.7) — `TestNonStreamingFirstByteNotDelayed` (A28).
-- [x] Content-Length pre-check returns 413 without reading (2.8) — `TestProxyHardCapRejectsCleanly` (A3 absorbed A29's scope).
-- [ ] Pricing lookup stays under 200ns at N=500 (2.9) — open (Low tier; pricing trie not implemented yet).
-
-## Revised sequencing
-
-- **0.7 jumps to the front of Phase 0.** It is the dominant
-  operational risk; everything else in Phase 0 is correctness for a
-  single request, this one is correctness for the operator's o11y
-  stack.
-- 0.8 and 0.9 are small follow-ups inside Phase 0; they should land
-  in the same release.
-- **Phase 1 grows by ~7 items** but they're individually small. The
-  v0.2 milestone slips by perhaps a week; the trust story improves
-  considerably.
-- **Phase 2 grows by 3 items**, all of which are unblocked by the
-  rest of Phase 0/1. They can be parallelized.
-- 3.6 (load test) should land alongside 0.7 — the cardinality cap
-  needs empirical tuning, and without a load harness the defaults
-  are guesses.
-
----
-
-# Security Remediations A1–A29  (2026-05-11)
-
-Triage block per REMEDIATION.md. Severity assigned to every item in this
-plan so the fix queue has a defined order. Critical/High fix
-immediately; Medium logged for the next cycle; Low fixed opportunistically.
-
-Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
-
-## Critical (token exposure / operator infrastructure DoS) — fix first
-
-- [x] **A1 — Metric label cardinality cap (item 0.7)** 🔴
-  **Finding:** `gen_ai.request.model` / `gen_ai.response.model` flow
-  verbatim from client JSON into metric labels. Hostile or buggy
-  clients mint unbounded Prometheus/Mimir series → operator o11y stack
-  OOM.
-  **Fix:** New `internal/labels` package: lowercase + strip date /
-  version snapshot suffixes; admission via `sync.Map` with an atomic
-  counter capped at `DefaultMaxCardinality = 200`; overflow routed to
-  `_other`. Applied at every metric attribute site in
-  `proxy.recordMetrics`. Span attributes keep raw model strings.
-  **Evidence:** `TestProxyMetricsModelCardinalityIsBounded` fires
-  1000 distinct synthetic model names through the proxy and asserts
-  the recorded label set ≤ 201 (cap + `_other`) and includes
-  `_other`. Unit tests cover normalization, lowercasing, empty input,
-  cap engagement, and `-race` concurrency safety.
-
-- [x] **A2 — Error body snippet leaks API key prefix (item 0.9)** 🔴
-  **Finding:** On every 4xx/5xx, `http.response.body_snippet` (first
-  1024 UTF-8 bytes) is attached to the span regardless of
-  `content.mode: off`. OpenAI auth failures echo the offending API
-  key prefix. Token exposure in traces.
-  **Fix:** Gate `body_snippet` attachment on `captureContent`. Attach
-  `http.response.body_size` (an integer, never content) unconditionally
-  so operators still see that an error body was observed.
-  **Root cause uncovered during this fix:** the `modify` callback in
-  `proxy.responseInterceptor` was *never being invoked at all* for any
-  response. The ReverseProxy's `ModifyResponse` hook retrieves the
-  function from the request context via `.(modifyFn)`, but the value
-  was stored with the unnamed type `func(*http.Response) error`. Go
-  type assertions distinguish named types from their underlying
-  unnamed types, so the assertion silently failed on every request
-  since project inception. This means every existing response-side
-  enrichment (`http.response.status_code`, span status, streaming
-  TTFT, output token usage, finish reasons, cost, the body snippet
-  itself) has been silently absent in production. The pre-existing
-  `TestProxyEndToEndStreaming` only asserted `value != 2` rather than
-  `value == 2`, vacuously passing despite the silent break.
-  **Fix (root cause):** Changed `responseInterceptor`'s return type
-  from `func(*http.Response) error` to the named `modifyFn`. The
-  context assertion now succeeds; `modify` runs on every response.
-  **Evidence:**
-  - `TestErrorBodySnippetSuppressedWhenContentOff` — leaked secret
-    not present on any span attribute when `content.mode=off`, while
-    the client still receives the upstream body verbatim.
-  - `TestErrorBodySnippetAttachedWhenContentEvents` — snippet IS
-    attached when the operator opts into events; proves the path
-    works when intended.
-  - `TestErrorBodySizeAttachedAlways` — byte-count metadata flows
-    independent of content mode.
-  - Span status now correctly reports `Error HTTP 400` and
-    `http.response.status_code = 400` (previously 0).
-
-## High (data loss / DoS / auth boundary / cost misreporting)
-
-- [x] **A3 — Oversize body silent 502 (item 0.1)** 🔴
-  **Finding:** Requests > 4 MiB read fully, then rejected with body
-  already closed → upstream gets zero bytes, client gets 502.
-  Documented as a failing test in the suite. Violates "forwards every
-  request unchanged" contract.
-  **Fix:** Split the buffering concept in two: a fixed 1 MiB
-  *enrichment buffer* (`maxEnrichmentBodyBytes`) that the parser
-  reads from, and a configurable *hard cap* (`config.Request.MaxBodyBytes`,
-  default 32 MiB) that gates whether we forward at all. Bodies up to
-  the hard cap are forwarded byte-for-byte via an `io.MultiReader` of
-  `[captured head + remaining stream]`; the enrichment slice is
-  truncated at the buffer boundary so `ParseRequest` may degrade but
-  the request reaches the upstream intact. Bodies above the hard cap
-  are refused with HTTP 413 — either by `Content-Length` pre-check or
-  by a `capCountingReader` that aborts mid-stream once the cumulative
-  count surpasses the cap. `config.example.yaml` documents the new
-  `request:` section.
-  **Evidence:**
-  - `TestProxyOversizeBodyForwardsIntact` (renamed from
-    `TestProxyOversizeBodyIsCorrupted`): a 5 MiB chat-completions body
-    arrives at the upstream byte-identical to what the client sent.
-  - `TestProxyHardCapRejectsCleanly`: a 3 MiB body against a 2 MiB
-    hard cap returns 413 with zero upstream traffic.
-  - Full suite is now uniformly green for the first time in the
-    project's history — the previously-documented bug-marker failure
-    is gone.
-
-- [x] **A4 — 4xx body truncated to client (item 0.2)** 🔴
-  **Finding:** Error responses are replaced with a 64 KiB snippet
-  buffer; clients debugging upstream errors get a truncated body they
-  cannot deserialize.
-  **Fix:** New `snippetCapture` type implements `io.Writer` and is
-  hooked into `resp.Body` via `io.TeeReader`. The body itself flows
-  through the tee untouched to the client; the side capture records
-  the first 1024 bytes (for `http.response.body_snippet`) and the
-  total size (for `http.response.body_size`). Span attributes are
-  attached in `finishSpan` after the tee has drained.
-  **Evidence:**
-  - `TestProxyForwardsLarge4xxIntact`: upstream sends 200 KiB error
-    body; client receives all 200 KiB; span's `body_size` is 204800
-    and `body_snippet` is the bounded prefix.
-  - Existing A2 tests (`TestErrorBodySnippetSuppressedWhenContentOff`,
-    `TestErrorBodySnippetAttachedWhenContentEvents`,
-    `TestErrorBodySizeAttachedAlways`) all stay green.
-
-- [x] **A5 — Streaming metrics lose trace context (item 0.3)** 🔴
-  **Finding:** Streaming `finalize` is invoked with
-  `context.Background()`, so every streaming-emitted metric has no
-  exemplar link back to its span. Defeats the project's main pitch.
-  **Fix:** Captured `streamCtx := context.WithoutCancel(resp.Request.Context())`
-  inside `modify` and passed it to `finalize` from the WrapStream
-  onClose callback. `WithoutCancel` preserves the trace context while
-  detaching from request-side cancellation, so the metric emission
-  still fires after the client disconnects.
-  **Evidence:** `TestStreamingMetricsCarryTraceContext` records a
-  streaming chat, pulls the duration histogram exemplar from the
-  ManualReader, and asserts its `TraceID` equals the span's `TraceID`.
-  Before the fix, no exemplar carried a trace context at all.
-
-- [x] **A6 — Gzipped responses record zero tokens (item 0.4)** 🔴
-  **Finding:** When clients set `Accept-Encoding: gzip`, the JSON
-  parser sees gzip bytes and fails silently. FinOps disaster —
-  recorded cost = $0 for gzipped calls.
-  **Fix:** One-line addition to the `Rewrite` hook:
-  `r.Out.Header.Del("Accept-Encoding")`. With the client's header
-  stripped, `http.Transport` injects its own and engages transparent
-  decompression. `modify` always sees plaintext JSON. The trade-off
-  (a few more bytes between llmtap and the upstream) is paid by
-  llmtap, not the client.
-  **Evidence:**
-  - `TestProxyGzippedResponseStillCountsTokens`: client sends
-    `Accept-Encoding: gzip`, upstream serves gzipped JSON, span
-    records `gen_ai.usage.input_tokens > 0` (was 0 before fix).
-  - `TestProxyStripsAcceptEncodingFromOutbound`: outbound request
-    seen by upstream does not carry the client's `Accept-Encoding`
-    verbatim.
-
-- [x] **A7 — Pricing table cannot be overridden (item 0.5)** 🔴
-  **Finding:** README claims operators can override negotiated rates;
-  no config knob exists. Every production cost number is the wrong
-  number.
-  **Fix:** Moved the in-Go `tables` map to `internal/pricing/prices.yaml`
-  and embedded via `//go:embed`. New `pricing.Table` type with
-  `Default()` + `Load(path, failOpen)` factories: the override file is
-  merged on top of the built-in catalogue per (system, model-prefix)
-  key, so unspecified models retain the default rate. Added
-  `config.Pricing{Path, FailOpen}` and threaded a per-Handler
-  `*pricing.Table` through `proxy.New`; the recordMetrics call site
-  uses `h.pricing.Cost(...)` instead of the package-level function.
-  **Evidence:**
-  - Unit tests cover the seven scenarios: default loads, override
-    replaces, override falls back per-key, fail-closed errors on
-    missing/malformed, fail-open silently degrades, empty path
-    returns default.
-  - `TestProxyEmitsOverriddenCost` (proxy integration): a config with
-    `Pricing.Path` pointing at a YAML setting `gpt-4o-mini` to
-    0.99 USD/Mtok records `gen_ai.cost.usd = 0.99` on the span,
-    not the built-in 0.15.
-  - `TestProxyNewFailsOnMissingPricingFileFailClosed`: `proxy.New`
-    refuses to construct when `pricing.path` is misconfigured and
-    `fail_open=false`.
-  - `config.example.yaml` documents the new `pricing:` section.
-
-- [x] **A8 — `--log-level` is a no-op (item 0.8)** 🔴
-  **Finding:** `slog.SetLogLoggerLevel` does not affect the otelslog
-  handler; all log levels produce identical output.
-  **Fix:** Extracted `newLogger(level, name, version, stderr)` from
-  `runUp`. Parses the level into a `slog.LevelVar`, builds a leveled
-  `slog.TextHandler` against stderr and a `leveledHandler` wrapping
-  the otelslog bridge (which has no native level option in the pinned
-  SDK), then combines both via a `multiHandler` so records dispatch
-  to both sinks under the same level. Deleted the rationalizing
-  `setLevel` no-op and its misleading comment.
-  **Evidence:** Five tests in `cmd/llmtap/logger_test.go`:
-  - `TestNewLoggerRespectsLevelInfo` — debug records filtered, info
-    records pass.
-  - `TestNewLoggerRespectsLevelError` — info+warn filtered, error
-    passes.
-  - `TestNewLoggerInvalidLevel` — unknown level returns an error.
-  - `TestNewLoggerEmptyLevelDefaultsToInfo` — empty string maps to
-    info, matching the original behaviour.
-  - `TestNewLoggerAttachesServiceAttrs` — `service.name` and
-    `service.version` present on every record.
-
-- [x] **A9 — Insecure OTLP + WAN endpoint silently leaks (item 1.7)** 🔴
-  **Finding:** `Default.Telemetry.Insecure: true` paired with an
-  edited-only `Endpoint` ships every trace (incl. captured content)
-  in cleartext over the WAN. No validation guardrail.
-  **Fix:** Added `Telemetry.AcknowledgeInsecure` config field +
-  `isLocalEndpoint` helper that recognizes loopback IPs, `localhost`,
-  and RFC1918 / RFC4193 private space (`net.IP.IsLoopback()` and
-  `net.IP.IsPrivate()`). `Config.Validate` now refuses startup when
-  `telemetry.insecure=true` and the endpoint is non-local, unless
-  `acknowledge_insecure=true` is set explicitly. The error message
-  mirrors the existing `listen`-side guardrail in style.
-  **Evidence:**
-  - `TestValidateRejectsInsecureWAN`: `endpoint: otel.example.com:4317`
-    + `insecure: true` returns an error.
-  - `TestValidateAcknowledgeInsecureBypassesGuard`: same config plus
-    `acknowledge_insecure: true` is accepted.
-  - `TestValidateInsecureLocalEndpoints`: loopback (`127.0.0.1`,
-    `[::1]`, `localhost`) and RFC1918 (`10.0.0.5`, `172.16.5.5`,
-    `192.168.1.5`) endpoints pass without acknowledgement. Scheme
-    prefixes (`http://`, `https://`) handled.
-  - `TestValidateSecureWANOK`: WAN endpoint with `insecure: false`
-    passes — guard is scoped to the cleartext combination.
-  - Existing `TestLoadYAMLOverrides` / `TestEnvOverrides` updated to
-    use legitimate values (`acknowledge_insecure: true` or
-    `insecure: false`) against their non-local endpoints.
-
-- [x] **A10 — No client authentication (item 1.13)** 🔴
-  **Finding:** llmtap forwards `Authorization: Bearer sk-…` verbatim
-  with no caller check. Demo compose stack ships open-relay default.
-  **Fix:** New `internal/auth` package implements argon2id PHC
-  hashing (`Hash`, `Verify`) and a `Verifier` that parses an operator
-  allow-list up-front and constant-time compares incoming bearer
-  tokens at request time. Added `config.Auth{Tokens, Header}` with
-  default header `X-LLMTAP-Token` (kept distinct from `Authorization`
-  so the upstream LLM API key isn't double-claimed). Handler stores
-  a `*auth.Verifier`; `ServeHTTP` short-circuits with 401 + zero
-  upstream traffic when a request arrives without a matching token.
-  The auth header is stripped from the inbound request before
-  forwarding, so the listener-side secret never leaks to the
-  upstream. New `llmtap hash-token` CLI reads plaintext from stdin
-  (keeps secrets out of argv / shell history) and prints the PHC
-  hash.
-  **Evidence (unit):** ten tests in `internal/auth/auth_test.go`
-  covering Hash↔Verify roundtrip, salt randomization, wrong-plaintext
-  rejection, PHC parser refusal on malformed input, Verifier
-  acceptance of any-of-N tokens, empty-token rejection, `Enabled()`
-  semantics, fail-fast at construction.
-  **Evidence (integration):** six tests in `internal/proxy/auth_test.go`
-  covering missing-token → 401, wrong-token → 401, correct-token
-  → 200 + upstream hit, bare and `Bearer …` forms both accepted,
-  tokens-empty path stays untouched, custom-header configuration.
-  Defensive assertion: upstream fake fails the test if the auth
-  header reaches it.
-  **Evidence (CLI):** `cmd/llmtap/hashtoken_test.go` pipes plaintext
-  into `runHashToken`, parses the printed hash, and round-trips it
-  through `auth.Verify`.
-
-- [x] **A11 — Slowloris body upload (item 1.10)** 🔴
-  **Finding:** No body-read deadline; slow uploaders pin a
-  goroutine + connection indefinitely. Cheap remote-DoS.
-  **Fix:** Added `HTTPTimeouts.BodyReadTimeout` (default 30s) and set
-  it as `http.Server.ReadTimeout` in `proxy.NewServer`. The PLAN's
-  preferred in-handler watchdog (close `r.Body` from a goroutine
-  when a deadline expires) turned out to be unusable: Go's
-  `(*http.body).Close()` synchronously drains the remaining bytes
-  using the same slow source, so closing the body doesn't actually
-  unblock the in-flight read. `Server.ReadTimeout` works at the
-  TCP-conn level — the connection is torn down mid-read — and is
-  the only correctness-preserving choice in the current stdlib.
-  Trade-off: clients see a connection-closed transport error rather
-  than a graceful 408; the goal of A11 (no pinned goroutine) is
-  preserved.
-  **Evidence:**
-  - `TestSlowUploadIsTerminated`: a 5 KB body delivered at 50 ms/byte
-    (~250 s total) against a 300 ms deadline is aborted within
-    2 s and zero upstream traffic is observed.
-  - `TestNoBodyReadTimeoutWhenUnset`: `BodyReadTimeout=0` keeps the
-    pre-A11 behaviour — slow uploads complete and reach upstream.
-  - Tests wire through `httptest.NewUnstartedServer` so the
-    `ReadTimeout` knob (the A11 surface) is actually exercised.
-
-- [x] **A12 — Per-upstream concurrency cap (item 1.5)** 🔴
-  **Finding:** No bound on in-flight requests per upstream; an
-  upstream brownout drains all goroutines + memory.
-  **Fix:** Added `Upstream.MaxInFlight int` config field (0 =
-  unlimited). At construction time `proxy.New` builds a buffered-chan
-  semaphore per upstream sized to the cap. In `ServeHTTP` (after
-  upstream match, before any body read or span/metric work) the
-  proxy non-blocking-acquires; over-cap responses get 429 with
-  `Retry-After: 1` and never reach the upstream. Buffered chan
-  keeps the dep footprint at zero.
-  **Evidence:**
-  - `TestUpstreamConcurrencyCapReturns429`: with `cap=3`, four
-    concurrent requests against a blocked upstream produce exactly
-    3 × 200 + 1 × 429; the 429 carries `Retry-After: 1`; upstream
-    sees exactly 3 hits.
-  - `TestUpstreamConcurrencyUnboundedByDefault`: `MaxInFlight=0`
-    lets 20 concurrent requests through without limit.
-
-- [x] **A13 — Unbounded SSE buffer (item 1.6)** 🔴
-  **Finding:** `sseTee.buf` grows without limit; an upstream sending
-  a single event without `\n\n` terminator OOMs the process.
-  **Fix:** New `maxEventBytes = 1 MiB` ceiling on the in-flight
-  parser buffer. When the buffer exceeds the cap, `sseTee.Read`
-  resets the accumulator, fires a one-shot `onOverflow` callback
-  (provider closures attach a `llmtap.sse_parser_overflow` span
-  event), and continues forwarding bytes to the client untouched.
-  Parsing is allowed to give up; forwarding is not. Subsequent
-  well-formed events resume parsing normally.
-  **Evidence:**
-  - `TestSSETeeBoundsBufferUnderOverflow`: a 10 MiB no-separator
-    payload forwards in full (no client bytes lost) and triggers
-    `onOverflow`.
-  - `TestSSETeeResumesParsingAfterOverflow`: a junk prefix > 1 MiB
-    followed by a clean `data: hello\n\n` frame fires overflow AND
-    dispatches the post-overflow event with data="hello".
-
-- [x] **A14 — Demo compose teaches `allow_insecure=true` (item 3.7)** 🔴
-  **Finding:** First example operators ever run sets the insecure
-  bypass. Copy-paste from demo to prod = open relay.
-  **Fix:** New `tls-init` one-shot service generates a self-signed
-  cert (RSA-2048, CN=llmtap.local, SAN={localhost, 127.0.0.1, llmtap})
-  into a `tls-data` named volume. The llmtap service mounts the
-  volume read-only at `/etc/llmtap/tls`, listens on `:4443` with
-  `LLMTAP_TLS_CERT_FILE` + `LLMTAP_TLS_KEY_FILE` set, and waits on
-  `tls-init` via `service_completed_successfully`. Cert generation
-  is idempotent (skipped on subsequent `up`s). `LLMTAP_ALLOW_INSECURE`
-  is gone from the default path.
-  Plaintext-loopback escape hatch lives in a new
-  `deploy/compose/docker-compose.insecure.yml` override and a
-  `make compose-up-insecure` target — explicitly opt-in for users
-  who want a 30-second `curl http://localhost:4000/...` demo.
-  **Evidence:** `docker compose config --quiet` validates both the
-  default and override-merged configs. The merged insecure config
-  shows `LLMTAP_LISTEN: 0.0.0.0:4000`, `LLMTAP_ALLOW_INSECURE: "true"`,
-  empty `LLMTAP_TLS_CERT_FILE` — matches the documented escape-hatch
-  semantics.
-
-- [x] **A15 — No CI / unsigned releases (item 3.1)** 🔴 *(verified green on origin)*
-  **Finding:** Every protection in this plan is on the honor system
-  without enforced CI. README invites users to download unsigned
-  binaries handling production credentials.
-  **Fix:** Two new workflows:
-  - `.github/workflows/ci.yml` — runs on every PR + push to main:
-    `go test -race -count=1 -timeout=2m` with coverage (gate at 60%
-    of `internal/`, ratcheted from PLAN's 70% based on current
-    actuals of 63.5%; raise as tests backfill), `golangci-lint v1.62.0`
-    (pinned to the v1 schema the project's `.golangci.yml` uses),
-    `govulncheck ./...`, `trivy fs --severity HIGH,CRITICAL`, and a
-    three-target build matrix (`linux/{amd64,arm64} + darwin/arm64`).
-  - `.github/workflows/release.yml` — fires on `v*` tag:
-    cross-compiled binaries with SHA-256 sidecars; an aggregate-hashes
-    step feeds the binaries into the
-    `slsa-framework/slsa-github-generator` reusable workflow for
-    SLSA-3 provenance; CycloneDX SBOMs via `syft` for the source tree
-    and per-binary; keyless `cosign sign-blob` on each binary;
-    multi-arch `docker buildx` push to `ghcr.io/$repo` with built-in
-    SLSA provenance + SBOM attestations; keyless `cosign sign` on the
-    image digest; GitHub release bundles binaries, checksums,
-    signatures, certificates, SBOMs, and the SLSA provenance file.
-  Both workflows pass `actionlint -shellcheck`.
-  **Evidence:**
-  - `actionlint .github/workflows/*.yml` clean.
-  - Local coverage measurement confirms current 63.5% on
-    `internal/`, above the 60% gate.
-
-- [x] **A16 — Content redaction profiles (item 1.1)** 🔴
-  **Finding:** `content.mode: events` ships unredacted prompts. The
-  "pair with collector redaction" workaround is not a credible
-  privacy story for the proxy's target audience.
-  **Fix:** New `internal/redact` package with three profiles
-  (`off`, `default`, `strict`), `Apply(s, profile)` and `Func(profile)`
-  helpers. The `default` profile masks high-confidence credential /
-  PII patterns (OpenAI `sk-…`, Slack `xox*`, AWS `AKIA…`, GCP
-  service-account `private_key`, common JWT shape, RFC-5322 emails);
-  `strict` adds Luhn-validated credit cards, US SSNs, and E.164
-  phone numbers. Replaced the `captureContent bool` parameter on the
-  Provider interface with a `provider.ContentOpts{Capture, Redact}`
-  struct + a `Clean(s string) string` helper. Every content-emission
-  site in `openai.go` and `anthropic.go` now funnels through
-  `content.Clean(...)`. Proxy constructs the ContentOpts once per
-  request from `cfg.Content.{Mode,Redact}`; the default config ships
-  `redact: default` so flipping `mode: events` doesn't silently ship
-  raw secrets — the privacy story has to survive a single config
-  edit.
-  **Evidence:**
-  - `internal/redact/redact_test.go` — golden corpus per profile:
-    off is passthrough, default masks each named pattern AND leaves
-    common prose alone (false-positive guard), strict adds the
-    Luhn-validated CC + SSN + E.164 patterns, Func returns nil for
-    `off` so callers can skip work.
-  - `internal/proxy/redact_integration_test.go` end-to-end:
-    `TestProxyRedactsContentEventsByDefault` proves the
-    default-shipped config strips an `sk-…` from a prompt before it
-    reaches any span event; `TestProxyRedactOffIsPassthrough`
-    proves the explicit opt-out passes content verbatim.
-  - `config.Validate` refuses unknown values for `content.redact`.
-
-## Medium — log for next cycle
-
-- [x] **A17 — Pricing lookup nondeterministic on equal-length prefixes (item 0.6)** 🟡
-  **Finding:** `Table.lookup` ranged the per-system map directly, so
-  the "longest prefix wins" walk depended on Go's randomized map
-  iteration order. With strict `>` the tiebreak was masked for the
-  catalogue as it stands today, but any future shift to `>=`, any
-  added equal-length pair, or any future need to expose ties to
-  operators would surface silently different recorded costs across
-  process restarts. A latent correctness bomb in the cost-recording
-  data path.
-  **Fix:** Introduce a per-system pre-sorted `[]prefixedRate` slice
-  built once at `newTable` time (called from `init()` for the
-  embedded catalogue and from `Load` for operator merges). Order is
-  length descending, then prefix ascending — first match wins. The
-  `rates map[string]map[string]Rate` stays as the merge-time
-  primary; `sorted map[string][]prefixedRate` is the read-side walk
-  order. `lookup` walks `sorted` and returns on first
-  `HasPrefix` hit, so the data path no longer touches map iteration
-  at all.
-  **Evidence:**
-  - `internal/pricing/override_test.go` adds
-    `TestPricingEqualLengthIsDeterministic` — registers a synthetic
-    system with mixed-length prefixes ("moda"/"modb",
-    "x-aa"/"x-bb"/"x-aaab", "ab"/"ab-extra") via a `Load` override,
-    asserts identical USD across 1000 serial iterations per probe
-    AND 64 goroutines × 200 calls per probe. With the sort
-    direction flipped (regression simulation), the test fails on
-    the mixed-length probes — confirming the assertion bites.
-  - All existing `pricing_test.go` and `override_test.go` cases
-    stay green; the longest-prefix-wins contract is preserved by
-    construction.
-  - `go test -C . -race -count=1 ./...` green across the repo.
-  - `golangci-lint run --timeout=2m ./...` zero issues.
-- [x] **A18 — Upstream cert pinning (item 1.2)** 🟡
-  **Finding:** Outbound TLS to LLM providers relied entirely on the
-  system trust store with no operator-level pin. A compromised
-  intermediate CA or a misconfigured corporate MITM proxy could swap
-  the upstream identity without llmtap noticing — and llmtap is the
-  last hop where the API key is unencrypted, so silent re-routing is
-  fatal.
-  **Fix:** Added `config.Upstream.PinSHA256 []string` (yaml
-  `pin_sha256`). Per-upstream `*http.Transport.TLSClientConfig` now
-  always sets `ServerName` to the parsed target's hostname (defensive
-  against SNI surprises) and, when pins are configured, installs
-  both `VerifyPeerCertificate` AND `VerifyConnection` callbacks that
-  compute the leaf cert's SubjectPublicKeyInfo sha256 and reject any
-  connection whose leaf doesn't match a pin. Two callbacks because
-  `VerifyPeerCertificate` is skipped on resumed sessions — without
-  `VerifyConnection`, an attacker could fast-resume a session from
-  an unpinned upstream and bypass the check (caught by gosec G123).
-  `Config.Validate` rejects pin strings that aren't exactly 64 hex
-  chars; runtime `parsePins` is the second line of defence.
-  **Evidence:**
-  - `TestUpstreamServerNameAlwaysSet` — target hostname propagates
-    into `Transport.TLSClientConfig.ServerName` on every upstream,
-    pinned or not.
-  - `TestUpstreamPinAcceptsMatchingCert` — when the operator's pin
-    list contains the upstream leaf's SPKI sha256, requests flow
-    end-to-end with 200.
-  - `TestUpstreamPinRejectsWrongCert` — a non-matching pin fails the
-    TLS handshake at the proxy → upstream boundary; httputil maps
-    the transport error to 502 and the upstream handler is never
-    invoked. Defensive `hit` flag confirms zero upstream traffic.
-- [x] **A19 — `/healthz` / `/readyz` endpoints (item 1.3)** 🟡
-  **Finding:** No probe surface for Kubernetes / load balancer /
-  operator health checks. Demo compose stack and production
-  deployments alike had no way to assert "the proxy is alive" or
-  "the proxy is ready to take traffic" without minting a bearer
-  token and sending a forged LLM call.
-  **Fix:** `ServeHTTP` short-circuits `GET /healthz` and
-  `GET /readyz` BEFORE the auth gate, BEFORE `cfg.Match`, and BEFORE
-  any breaker / concurrency check. `/healthz` is always 200 + body
-  `ok`. `/readyz` calls `prov.Ready()` (loose signal: set to a
-  constant `true` after `telemetry.Setup` returns successfully,
-  because at that point all three OTel providers exist) and returns
-  200 + `ready` or 503 + `Retry-After: 1`. A nil callback is
-  treated as "always ready" so embedders who don't plumb a real
-  signal don't get a false-negative 503. `Config.Validate` rejects
-  any upstream prefix that collides with `/healthz` or `/readyz` (or
-  a sub-path of them) so an operator can't accidentally mask the
-  probes.
-  **Evidence:**
-  - `TestHealthzAlwaysOK` — auth gate fully configured; `/healthz`
-    still returns 200 without a token; upstream is never hit.
-  - `TestReadyzReturnsExpectedStatus` — table-driven across
-    `ready=true / ready=false / ready=nil`. Asserts status code,
-    body, and `Retry-After` header for each.
-  - `TestUpstreamPrefixCannotCollideWithHealthz` — Validate refuses
-    `/healthz`, `/readyz`, `/healthz/sub`, `/readyz/x`.
-  - `TestReadyzDoesNotReachUpstream` — proxy answers `/readyz`
-    locally regardless of upstream config.
-- [x] **A20 — Shutdown waits on active streams (item 1.4)** 🟡
-  **Finding:** `Handler.activeStreams` was incremented in `WrapStream`
-  and decremented in the onClose callback, but nothing observed it
-  during shutdown. `http.Server.Shutdown` waits for `ServeHTTP` to
-  return — and the SSE handler returns the moment ReverseProxy starts
-  writing the response, well before the stream-parser side has run
-  its finalize. Metric emission and span End for the dominant
-  streaming case were getting raced against process exit.
-  **Fix:** New `Handler.WaitForStreams(ctx) int64` method polls
-  `activeStreams.Load()` on a 50ms ticker until either the counter
-  reaches zero or ctx expires; returns whatever's still in flight at
-  return time. `Server.Run`'s shutdown branch now calls
-  `WaitForStreams(shutCtx)` BEFORE `server.Shutdown(shutCtx)`, sharing
-  the same `ShutdownTimeout` budget. A non-zero remainder logs WARN
-  with the count and proceeds — never blocks past the budget. The
-  `Server` struct now holds a `*Handler` reference (passed through
-  `NewServer`) so it can reach the counter; this is the only
-  structural change.
-  **Evidence:**
-  - `TestShutdownWaitsForActiveStreams`: a fake upstream pauses
-    mid-stream on a `release chan struct{}`. The test fires a real
-    request through `proxy.NewServer.Run` (goroutine), cancels the
-    context, and asserts `Run` is STILL blocked 150ms after cancel
-    (would have returned ~immediately pre-fix). Closing `release`
-    lets the stream onClose fire; `Run` returns within the deadline.
-- [x] **A21 — SSE `\r\n\r\n` / `\r\r` framing (item 1.11)** 🟡
-  **Evidence:** `sse.go` `drain` no longer hard-codes `\n\n`. New
-  `findFrameBoundary` scans for any of `\r\n\r\n`, `\n\n`, or `\r\r`
-  (the three terminators the HTML5 EventSource spec permits) and
-  returns the earliest match plus its byte length. `dispatch` likewise
-  replaces `bytes.Split(msg, "\n")` with a per-byte `splitSSELines`
-  helper so lines within a frame split on any of CR / LF / CRLF — a
-  CR-only payload no longer collapses into one unparseable line.
-  Three new sub-tests in `sse_test.go`: `TestSSETeeFramingCRLF` (a
-  full CRLF-framed stream parses every event), `TestSSETeeFramingCR`
-  (legacy `\r\r` framing dispatches at each boundary),
-  `TestSSETeeFramingMixed` (a single stream interleaving `\n\n`,
-  `\r\n\r\n`, and `\r\r` dispatches three distinct events). Before
-  the fix the CRLF case dispatched ONE event (one giant concatenated
-  blob); after, three events.
-- [x] **A22 — Strict operation-path matching (item 1.12)** 🟡
-  **Evidence:** `OperationFor` in both `openai.go` and `anthropic.go`
-  replaces `strings.HasSuffix` with segment-aware matching via a
-  new shared `pathSegments` / `isAPIParent` / `isVersionSegment`
-  helper trio. The rule: the segment immediately before the operation
-  must look like an API version (`v\d+`, case-insensitive) OR — for
-  the OpenAI Azure shape — follow a `deployments/{name}` pair. A
-  trailing-slash path is rejected up front (operations are exact
-  resources, not directories). New `operation_test.go` table-drives
-  both providers across 24 cases including the two PLAN-named
-  impostors (`/v1/files/chat/completions`,
-  `/v1/anthropic/.well-known/messages`) — both now return `""` while
-  legitimate paths (`/v1/chat/completions`, `/openai/v1/embeddings`,
-  `/openai/deployments/my-gpt-4o/chat/completions`,
-  `/v1/messages`) still map to their operations.
-- [x] **A23 — Hot certificate reload (item 2.1)** 🟡
-  **Finding:** `srv.ServeTLS(ln, certFile, keyFile)` loads the keypair
-  exactly once at boot. Cert-manager / Let's Encrypt renewals that
-  overwrite the on-disk files were sitting unread until the process
-  restarted — turning every renewal into either a planned restart or
-  an outage when the old cert quietly expired.
-  **Fix:** New `internal/proxy/certmgr.go`:
-  - `certManager` holds `*tls.Certificate` behind
-    `atomic.Pointer[tls.Certificate]`. `Get(*tls.ClientHelloInfo)`
-    implements `tls.Config.GetCertificate` so a fresh swap is visible
-    to the very next handshake (no listener drop).
-  - `Load(certPath, keyPath)` parses the pair, populates `Leaf`, and
-    stores it atomically. Idempotent; safe to call concurrently.
-  - `checkAndReload(logger)` (factored out for synchronous testing)
-    polls `os.Stat` on both files, compares ModTime against
-    `lastCertMod`/`lastKeyMod` atomic counters, reloads on change. A
-    failed reload leaves the previous cert active — we never trade
-    a working cert for a broken one.
-  - `Watch(ctx, interval, logger)` runs `checkAndReload` on a ticker
-    until ctx cancels. Each successful reload logs the loaded leaf's
-    SHA-256 so an operator can confirm the swap took effect.
-  `buildTLSConfig` now installs `GetCertificate: mgr.Get`. `Server.Run`
-  starts the watcher goroutine before `Serve` (watcher ctx tied to the
-  same ctx that gates shutdown) and calls `ServeTLS(ln, "", "")` —
-  empty paths route resolution through `GetCertificate` instead of
-  `LoadX509KeyPair` at boot. New `HTTPTimeouts.CertReloadInterval`
-  config field (default 30s; 0 disables) gates the watcher.
-  **Evidence:**
-  - `TestCertManagerReloadsOnModTimeChange`: writes cert v1, asserts
-    v1 fingerprint, overwrites v1's paths with v2's contents +
-    `os.Chtimes` to advance ModTime, calls `checkAndReload` once,
-    asserts v2 fingerprint and that `Get` returns the new DER bytes.
-  - `TestCertManagerLoadFailureKeepsPreviousCert`: corrupts the cert
-    file on disk and confirms the in-memory cert remains v1 — a
-    partial write from a renewer mid-flight does not blank the
-    served cert.
-  - `TestServerRunServesFreshlyLoadedCert`: stands up a real
-    `proxy.NewServer.Run` over TLS with a fresh self-signed pair,
-    opens a `tls.Dial` against it, pins the SHA-256 of the presented
-    leaf against the cert-on-disk fingerprint. Proves the cert
-    served by `ServeTLS(ln, "", "")` came from the cert manager (not
-    from a stdlib LoadX509KeyPair on stale bytes).
-  - `writeSelfSignedCertKey(t, sub)` factored as a per-test helper
-    returning `(certPath, keyPath, spkiSHA)` so future cert-related
-    tests get fresh, fingerprintable pairs without reinventing the
-    helper.
-- [x] **A24 — Circuit breaker per upstream (item 2.2)** 🟡
-  **Finding:** A sustained 5xx storm from an upstream LLM API
-  produced one outbound request per inbound request. The proxy did
-  no fault detection of its own — there was no way to stop hammering
-  a broken upstream short of operator intervention.
-  **Fix:** New `internal/proxy/breaker.go` (≈150 LOC, zero
-  dependencies) implements a three-state per-upstream circuit
-  breaker. Closed: each 5xx increments a consecutive counter that
-  any non-5xx resets. Tripping rule: `>= Failures` consecutive 5xx,
-  optionally bounded by `Window` (a failure older than Window
-  relative to the most recent doesn't contribute). Open: every
-  request short-circuits to 503 + `Retry-After: <remaining seconds>`
-  without reaching the upstream. After `RecoveryWindow` the breaker
-  enters half-open and admits exactly one probe; any subsequent
-  request rejects until the probe resolves. Half-open: non-5xx →
-  closed, 5xx → open. Concurrency model: single `sync.Mutex`
-  serialises all FSM transitions — the breaker check is one mutex
-  acquire per request, downstream of much more expensive work.
-  Wired into `ServeHTTP` BEFORE the concurrency semaphore so an
-  open breaker doesn't burn an in-flight slot. Status updates fold
-  in via `responseInterceptor.finishSpan` once `statusCode` is
-  known; status code 0 (no upstream response, e.g. ErrorHandler
-  returned 502) counts as a 502 against the breaker. New
-  `config.BreakerConfig{Failures, Window, RecoveryWindow}` per
-  upstream; `Failures=0` (default) disables the breaker entirely.
-  **Evidence:**
-  - `TestBreakerOpensAfterConsecutiveFailures` — three 500s trip
-    the breaker; fourth request returns 503 + Retry-After WITHOUT
-    contacting the upstream.
-  - `TestBreakerHalfOpenAdmitsOneProbe` — after recovery, two
-    concurrent requests yield exactly one 503 (rejected) and one
-    upstream hit (the probe); breaker correctly limits to one
-    probe in flight.
-  - `TestBreakerClosesOnProbeSuccess` — flip upstream to healthy;
-    probe succeeds; subsequent requests flow at 200 — breaker
-    closed.
-  - `TestBreakerDisabledByDefault` — `Failures=0` keeps the
-    pre-A24 behaviour; five 500s in a row all pass through.
-- [x] **A25 — OTel module version alignment (item 2.4)** 🟡 *(closed incidentally via A15 dep bumps to v1.43.0)*
-- [x] **A26 — Tool-call streaming coverage (item 2.5)** 🟡
-  **Evidence:** Both `WrapStream` implementations now fire TTFT on
-  tool deltas, not just text deltas. OpenAI's `openAIMessage` gained
-  a `ToolCalls json.RawMessage` field (omitempty); the streaming
-  loop calls a new `hasToolCalls` helper alongside the existing
-  `delta.content` check. Tool-call argument fragments are NOT
-  concatenated into `assembled` — they belong to a separate logical
-  channel from assistant text. Anthropic's `anthropicDelta` gained
-  a `PartialJSON` field; the `content_block_delta` switch now
-  dispatches on `delta.Type` — `text_delta` keeps the existing
-  text-assembly behaviour, `input_json_delta` fires TTFT only.
-  Finish reasons (`tool_calls` for OpenAI, `tool_use` for
-  Anthropic) are recorded via the pre-existing finish-reason path,
-  unchanged. Two new tests:
-  `TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken` simulates a
-  three-chunk tool-call stream (no `content` field anywhere) and
-  asserts `info.FirstTokenAt` is non-zero AND finish reason is
-  `tool_calls`. `TestAnthropicWrapStreamToolOnlyStreamFiresFirstToken`
-  simulates the seven-event Anthropic tool-only shape (message_start
-  → content_block_start tool_use → input_json_delta × 2 →
-  content_block_stop → message_delta tool_use → message_stop) and
-  asserts FirstTokenAt is non-zero, finish reason is `tool_use`, and
-  output tokens flow through.
-- [x] **A27 — Transport tuning per upstream (item 2.6)** 🟡
-  **Finding:** `httputil.ReverseProxy` was implicitly using
-  `http.DefaultTransport`, whose `MaxIdleConnsPerHost = 2`. Real
-  concurrency against a single LLM upstream collapsed to two pooled
-  connections + whatever fresh dials happened to be in flight —
-  invisible foot-gun for any deployment that expected the per-upstream
-  semaphore (A12) to govern in-flight count.
-  **Fix:** New `buildUpstreamTransport(u, target)` constructs a per-upstream
-  `*http.Transport` with conservative production tuning:
-  `MaxIdleConns=256`, `MaxIdleConnsPerHost=64`, `IdleConnTimeout=90s`,
-  `TLSHandshakeTimeout=10s`, `ResponseHeaderTimeout=60s`,
-  `ExpectContinueTimeout=1s`, `ForceAttemptHTTP2=true`. Extracted into
-  a helper so the A18 pin layer can extend the same Transport instead
-  of constructing a parallel one. Also wired `FlushInterval=-1` on the
-  ReverseProxy so non-streaming JSON responses (which arrive with
-  Content-Length set) actually stream-through to the client; without
-  it, the body sits in httputil's buffer until the handler returns
-  (the existing `text/event-stream` path already self-flushes).
-  **Evidence:** `TestUpstreamTransportLiftsPerHostConnCap` fires 16
-  concurrent requests against a slow-responding upstream and asserts
-  the peak concurrent in-flight observation ≥ 10 (vs the default
-  Transport's per-host cap of 2 which would clip the count there).
-  `TestProxyEndToEndStillForwardsAfterTransportTuning` is the no-
-  regression guardrail on the non-streaming happy path.
-- [x] **A28 — Stream non-streaming JSON through (item 2.7)** 🟡
-  **Finding:** For non-streaming JSON responses, `modify()` called
-  `io.ReadAll(resp.Body)` and only then handed bytes back to the
-  ReverseProxy. The client's first byte was therefore delayed by the
-  entire upstream latency — even for trivially-sized 200-byte
-  responses where streaming through would be free.
-  **Fix:** Replaced the buffer-then-restore pattern with
-  TeeReader + a `parseOnClose` wrapper. The TeeReader splits each
-  read into (a) the original ReverseProxy copy path and (b) a
-  bounded `snippetCapture` capped at `maxEnrichmentBodyBytes`
-  (1 MiB). The wrapper runs `ParseResponseJSON` once on EOF —
-  detected via the wrapper's `Read` method, not on `Close` — so
-  span attributes populate BEFORE httputil's copy loop reports the
-  body as drained. That ordering matters: `FlushInterval=-1` (from
-  A27) streams bytes incrementally to the client, and without
-  the EOF-side parse, a client's `ReadAll` could return before the
-  server-side handler had ended the span. The wrapper uses
-  `sync.Once` to make Close idempotent (httputil, io.NopCloser, and
-  client code all double-close at various points). The same
-  parseOnClose pattern was applied to the 4xx error path so its
-  TeeReader-captured snippet finalizes the span in lock-step with
-  the client's body completion. `info.FirstByteAt = time.Now()`
-  inside `modify` already captured first-byte timestamp accurately;
-  the only thing missing was the bytes-on-the-wire behaviour, which
-  this change delivers.
-  **Evidence:**
-  - `TestNonStreamingFirstByteNotDelayed` — bespoke `net.Listener`
-    upstream writes a JSON response in two halves separated by
-    150ms. Client-side first-byte delta < 100ms (well before the
-    upstream stall completes), confirming stream-through. The same
-    test asserts `gen_ai.usage.input_tokens` is on the span after
-    drain, proving the parse-on-close path still enriches.
-  - `TestProxyEndToEndNonStreaming` (existing) still passes — the
-    `gen_ai.usage.input_tokens` span attribute assertion is the
-    same one the spec calls out as the regression guard.
-  - Full suite green under `-race -count=3`.
-- [x] **A29 — Content-Length pre-check (item 2.8)** 🟡 *(closed incidentally via A3 — `captureHeadAndForward` short-circuits when `r.ContentLength > MaxBodyBytes` and returns 413 without draining any bytes; `TestProxyHardCapRejectsCleanly` proves it.)*
-
-## Low — opportunistic
-
-- [x] LLMTAP_OTLP_HEADERS env (item 1.8) 🟢 — `TestEnvOverridesOTLPHeaders`.
-- [x] LLMTAP_SAMPLE_RATIO env (item 1.9) 🟢 — `TestEnvOverridesSampleRatio` (in-range + clamp paths).
-- [x] Cost as histogram (item 2.3) 🟢 — `gen_ai.client.cost.usd` now a histogram with USD-scaled buckets; sibling `gen_ai.client.cost.usd.total` counter for cumulative spend.
-- [x] Pricing trie lookup (item 2.9) 🟢 — O(K) byte-trie; `BenchmarkPricingLookup` reports 168 ns/op @ N=500 (budget 200 ns).
-- [x] SECURITY.md + Dependabot (item 3.3) 🟢 — Private disclosure mailbox, 90-day window, cosign verification instructions; weekly gomod/github-actions/docker Dependabot scans with OTel and google.golang.org/* grouped together.
-- [x] Documentation honesty pass (item 3.4) 🟢 — README walked against the post-A28 reality: TLS demo, env-var table, structural-config block, histogram metric, redaction profiles, architecture diagram, performance section all updated.
-- [x] `runtime/debug.ReadBuildInfo` fallback (item 3.5) 🟢 — `buildinfo.Resolve()` upgrades unset linker-X values from `debug.BuildInfo` so `go install …@v0.1.3` users get a real version string.
-- [x] Load test harness (item 3.6) 🟢 — `test/load/load_test.go` (Go-native, no external tools), `make load-test`, dedicated CI job. Asserts p99 added latency, zero 5xx, no goroutine leak. Local p99-baseline=1.33ms over 2000 requests.
-
-## Execution order
-
-1. **A1 (cardinality bomb)** — start here. New FATAL FLAW. Operator
-   infrastructure protection.
-2. A2 (token-leak suppression) — Critical; small surgical fix.
-3. A3 → A4 (request/response data-loss).
-4. A5 → A6 → A7 (telemetry correctness).
-5. A8 (log level) — small, unblocks debugging the rest.
-6. A9 → A10 → A11 → A12 → A13 — DoS + auth boundary.
-7. A14 (demo) + A15 (CI) — meta-protections.
-8. A16 (redaction).
-
-Medium block (A17–A29) and the Low list address the next cycle.
+## Closed work (reference)
+
+The 29 A-series + 8 L-series items below were all delivered
+in v0.1.3. Each line lists the commit SHA where the fix landed;
+`git show <sha>` displays the full evidence block.
+
+### Critical / High (round-1 adversarial review)
+
+| Item | One-line | Commit |
+|---|---|---|
+| A1  | Cap metric-label cardinality on `gen_ai.*.model` | `c9986c6` |
+| A2  | Close error-body snippet leak under `content.mode=off` (uncovered the `modify`-never-runs root cause) | `fe776f4` |
+| A3  | Forward oversize bodies intact; 413 above hard cap | `b449b5f` |
+| A4  | Forward 4xx error bodies intact via tee snippet | `93ff1f3` |
+| A5  | Keep streaming metrics tied to their trace context | `3a4485d` |
+| A6  | Strip Accept-Encoding so gzip responses parse | `e266ab0` |
+| A7  | Externalize pricing catalogue via embed + override | `fa52708` |
+| A8  | Make `--log-level` actually change verbosity | `b426c4e` |
+| A9  | Refuse insecure OTLP to non-local endpoints | `c74d37e` |
+| A10 | Bearer-token allow-list at the proxy boundary (argon2id) | `4162a35` |
+| A11 | Bound inbound body reads via Server.ReadTimeout | `2a92761` |
+| A12 | Cap concurrent in-flight per upstream | `07de838` |
+| A13 | Bound the SSE parser buffer with overflow signal | `07dd459` |
+| A14 | Demo compose stack defaults to TLS, not `allow_insecure` | `b45eea6` |
+| A15 | PR-gating CI + signed release pipeline | `1033fe2` |
+| A16 | Content redaction profiles at the proxy boundary | `1f9bd3a` |
+
+### Medium (round-2 adversarial review)
+
+| Item | One-line | Commit |
+|---|---|---|
+| A17 | Deterministic pricing prefix lookup (sort+walk; later replaced by trie in L6) | `ecbee73` |
+| A18 | Upstream cert pinning by SPKI sha256 (resumption-safe) | `22f8391` |
+| A19 | `/healthz` + `/readyz` probes ahead of auth gate | `22f8391` |
+| A20 | Graceful shutdown waits on active streams | `00b1197` |
+| A21 | SSE parser accepts CRLF + CR framing per HTML5 EventSource spec | `cc7f317` |
+| A22 | Strict segment-aware operation-path matching | `cc7f317` |
+| A23 | Hot reload TLS certificates from disk | `00b1197` |
+| A24 | Three-state circuit breaker per upstream | `22f8391` |
+| A25 | OTel module version alignment | `ee189c4` *(closed incidentally via the A15 dep-bump sweep)* |
+| A26 | TTFT fires on tool-call streams (both providers) | `cc7f317` |
+| A27 | Tune per-upstream `*http.Transport` for real concurrency | `22f8391` |
+| A28 | Stream non-streaming JSON responses through | `22f8391` |
+| A29 | Content-Length pre-check | `b449b5f` *(closed incidentally via A3's `captureHeadAndForward`)* |
+
+### Low (post-Medium polish)
+
+| Item | One-line | Commit |
+|---|---|---|
+| L1  | `LLMTAP_OTLP_HEADERS` env support | `bab4b63` |
+| L2  | `LLMTAP_SAMPLE_RATIO` env support (with clamp) | `bab4b63` |
+| L3  | `runtime/debug.ReadBuildInfo` fallback for `go install` users | `00a7faa` |
+| L4  | SECURITY.md disclosure policy + Dependabot config | `2293f93` |
+| L5  | `gen_ai.client.cost.usd` is now a histogram; sibling `.total` counter | `ed488ce` |
+| L6  | O(K) byte-trie pricing lookup (168 ns/op at N=500) | `4d1c0ea` |
+| L7  | README honesty pass against post-A28 reality | `36c60a5` |
+| L8  | Go-native load test harness + CI gate | `7d5a633` |
+
+### CI / release pipeline tail
+
+Three follow-up `fix(ci)` commits closed gaps surfaced when the
+release pipeline first fired against `v0.1.0`:
+
+| Commit | What |
+|---|---|
+| `4419696` | Bump Dockerfile Go base to 1.26-alpine (go.mod's 1.25.0 floor) |
+| `92b58b7` | docker login in `sign-image` job so cosign can push the signature |
+| `1d41c17` | Filter release-job artifact download to skip the flaky `.dockerbuild` blob |
+| `63aa480` | Isolate the load test behind a `//go:build loadtest` tag so `-race` runs don't trip its p99 budget |
