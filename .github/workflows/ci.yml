@@ -52,7 +52,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - uses: golangci/golangci-lint-action@v7
+      - uses: golangci/golangci-lint-action@v9
         with:
           # v2.x understands the project's v2-schema .golangci.yml.
           version: v2.12.2
