@@ -1181,17 +1181,168 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 ## Medium — log for next cycle
 
 - [ ] **A17 — Pricing lookup nondeterministic on equal-length prefixes (item 0.6)** 🟡
-- [ ] **A18 — Upstream cert pinning (item 1.2)** 🟡
-- [ ] **A19 — `/healthz` / `/readyz` endpoints (item 1.3)** 🟡
+- [x] **A18 — Upstream cert pinning (item 1.2)** 🟡
+  **Finding:** Outbound TLS to LLM providers relied entirely on the
+  system trust store with no operator-level pin. A compromised
+  intermediate CA or a misconfigured corporate MITM proxy could swap
+  the upstream identity without llmtap noticing — and llmtap is the
+  last hop where the API key is unencrypted, so silent re-routing is
+  fatal.
+  **Fix:** Added `config.Upstream.PinSHA256 []string` (yaml
+  `pin_sha256`). Per-upstream `*http.Transport.TLSClientConfig` now
+  always sets `ServerName` to the parsed target's hostname (defensive
+  against SNI surprises) and, when pins are configured, installs
+  both `VerifyPeerCertificate` AND `VerifyConnection` callbacks that
+  compute the leaf cert's SubjectPublicKeyInfo sha256 and reject any
+  connection whose leaf doesn't match a pin. Two callbacks because
+  `VerifyPeerCertificate` is skipped on resumed sessions — without
+  `VerifyConnection`, an attacker could fast-resume a session from
+  an unpinned upstream and bypass the check (caught by gosec G123).
+  `Config.Validate` rejects pin strings that aren't exactly 64 hex
+  chars; runtime `parsePins` is the second line of defence.
+  **Evidence:**
+  - `TestUpstreamServerNameAlwaysSet` — target hostname propagates
+    into `Transport.TLSClientConfig.ServerName` on every upstream,
+    pinned or not.
+  - `TestUpstreamPinAcceptsMatchingCert` — when the operator's pin
+    list contains the upstream leaf's SPKI sha256, requests flow
+    end-to-end with 200.
+  - `TestUpstreamPinRejectsWrongCert` — a non-matching pin fails the
+    TLS handshake at the proxy → upstream boundary; httputil maps
+    the transport error to 502 and the upstream handler is never
+    invoked. Defensive `hit` flag confirms zero upstream traffic.
+- [x] **A19 — `/healthz` / `/readyz` endpoints (item 1.3)** 🟡
+  **Finding:** No probe surface for Kubernetes / load balancer /
+  operator health checks. Demo compose stack and production
+  deployments alike had no way to assert "the proxy is alive" or
+  "the proxy is ready to take traffic" without minting a bearer
+  token and sending a forged LLM call.
+  **Fix:** `ServeHTTP` short-circuits `GET /healthz` and
+  `GET /readyz` BEFORE the auth gate, BEFORE `cfg.Match`, and BEFORE
+  any breaker / concurrency check. `/healthz` is always 200 + body
+  `ok`. `/readyz` calls `prov.Ready()` (loose signal: set to a
+  constant `true` after `telemetry.Setup` returns successfully,
+  because at that point all three OTel providers exist) and returns
+  200 + `ready` or 503 + `Retry-After: 1`. A nil callback is
+  treated as "always ready" so embedders who don't plumb a real
+  signal don't get a false-negative 503. `Config.Validate` rejects
+  any upstream prefix that collides with `/healthz` or `/readyz` (or
+  a sub-path of them) so an operator can't accidentally mask the
+  probes.
+  **Evidence:**
+  - `TestHealthzAlwaysOK` — auth gate fully configured; `/healthz`
+    still returns 200 without a token; upstream is never hit.
+  - `TestReadyzReturnsExpectedStatus` — table-driven across
+    `ready=true / ready=false / ready=nil`. Asserts status code,
+    body, and `Retry-After` header for each.
+  - `TestUpstreamPrefixCannotCollideWithHealthz` — Validate refuses
+    `/healthz`, `/readyz`, `/healthz/sub`, `/readyz/x`.
+  - `TestReadyzDoesNotReachUpstream` — proxy answers `/readyz`
+    locally regardless of upstream config.
 - [ ] **A20 — Shutdown waits on active streams (item 1.4)** 🟡
 - [ ] **A21 — SSE `\r\n\r\n` / `\r\r` framing (item 1.11)** 🟡
 - [ ] **A22 — Strict operation-path matching (item 1.12)** 🟡
 - [ ] **A23 — Hot certificate reload (item 2.1)** 🟡
-- [ ] **A24 — Circuit breaker per upstream (item 2.2)** 🟡
+- [x] **A24 — Circuit breaker per upstream (item 2.2)** 🟡
+  **Finding:** A sustained 5xx storm from an upstream LLM API
+  produced one outbound request per inbound request. The proxy did
+  no fault detection of its own — there was no way to stop hammering
+  a broken upstream short of operator intervention.
+  **Fix:** New `internal/proxy/breaker.go` (≈150 LOC, zero
+  dependencies) implements a three-state per-upstream circuit
+  breaker. Closed: each 5xx increments a consecutive counter that
+  any non-5xx resets. Tripping rule: `>= Failures` consecutive 5xx,
+  optionally bounded by `Window` (a failure older than Window
+  relative to the most recent doesn't contribute). Open: every
+  request short-circuits to 503 + `Retry-After: <remaining seconds>`
+  without reaching the upstream. After `RecoveryWindow` the breaker
+  enters half-open and admits exactly one probe; any subsequent
+  request rejects until the probe resolves. Half-open: non-5xx →
+  closed, 5xx → open. Concurrency model: single `sync.Mutex`
+  serialises all FSM transitions — the breaker check is one mutex
+  acquire per request, downstream of much more expensive work.
+  Wired into `ServeHTTP` BEFORE the concurrency semaphore so an
+  open breaker doesn't burn an in-flight slot. Status updates fold
+  in via `responseInterceptor.finishSpan` once `statusCode` is
+  known; status code 0 (no upstream response, e.g. ErrorHandler
+  returned 502) counts as a 502 against the breaker. New
+  `config.BreakerConfig{Failures, Window, RecoveryWindow}` per
+  upstream; `Failures=0` (default) disables the breaker entirely.
+  **Evidence:**
+  - `TestBreakerOpensAfterConsecutiveFailures` — three 500s trip
+    the breaker; fourth request returns 503 + Retry-After WITHOUT
+    contacting the upstream.
+  - `TestBreakerHalfOpenAdmitsOneProbe` — after recovery, two
+    concurrent requests yield exactly one 503 (rejected) and one
+    upstream hit (the probe); breaker correctly limits to one
+    probe in flight.
+  - `TestBreakerClosesOnProbeSuccess` — flip upstream to healthy;
+    probe succeeds; subsequent requests flow at 200 — breaker
+    closed.
+  - `TestBreakerDisabledByDefault` — `Failures=0` keeps the
+    pre-A24 behaviour; five 500s in a row all pass through.
 - [x] **A25 — OTel module version alignment (item 2.4)** 🟡 *(closed incidentally via A15 dep bumps to v1.43.0)*
 - [ ] **A26 — Tool-call streaming coverage (item 2.5)** 🟡
-- [ ] **A27 — Transport tuning per upstream (item 2.6)** 🟡
-- [ ] **A28 — Stream non-streaming JSON through (item 2.7)** 🟡
+- [x] **A27 — Transport tuning per upstream (item 2.6)** 🟡
+  **Finding:** `httputil.ReverseProxy` was implicitly using
+  `http.DefaultTransport`, whose `MaxIdleConnsPerHost = 2`. Real
+  concurrency against a single LLM upstream collapsed to two pooled
+  connections + whatever fresh dials happened to be in flight —
+  invisible foot-gun for any deployment that expected the per-upstream
+  semaphore (A12) to govern in-flight count.
+  **Fix:** New `buildUpstreamTransport(u, target)` constructs a per-upstream
+  `*http.Transport` with conservative production tuning:
+  `MaxIdleConns=256`, `MaxIdleConnsPerHost=64`, `IdleConnTimeout=90s`,
+  `TLSHandshakeTimeout=10s`, `ResponseHeaderTimeout=60s`,
+  `ExpectContinueTimeout=1s`, `ForceAttemptHTTP2=true`. Extracted into
+  a helper so the A18 pin layer can extend the same Transport instead
+  of constructing a parallel one. Also wired `FlushInterval=-1` on the
+  ReverseProxy so non-streaming JSON responses (which arrive with
+  Content-Length set) actually stream-through to the client; without
+  it, the body sits in httputil's buffer until the handler returns
+  (the existing `text/event-stream` path already self-flushes).
+  **Evidence:** `TestUpstreamTransportLiftsPerHostConnCap` fires 16
+  concurrent requests against a slow-responding upstream and asserts
+  the peak concurrent in-flight observation ≥ 10 (vs the default
+  Transport's per-host cap of 2 which would clip the count there).
+  `TestProxyEndToEndStillForwardsAfterTransportTuning` is the no-
+  regression guardrail on the non-streaming happy path.
+- [x] **A28 — Stream non-streaming JSON through (item 2.7)** 🟡
+  **Finding:** For non-streaming JSON responses, `modify()` called
+  `io.ReadAll(resp.Body)` and only then handed bytes back to the
+  ReverseProxy. The client's first byte was therefore delayed by the
+  entire upstream latency — even for trivially-sized 200-byte
+  responses where streaming through would be free.
+  **Fix:** Replaced the buffer-then-restore pattern with
+  TeeReader + a `parseOnClose` wrapper. The TeeReader splits each
+  read into (a) the original ReverseProxy copy path and (b) a
+  bounded `snippetCapture` capped at `maxEnrichmentBodyBytes`
+  (1 MiB). The wrapper runs `ParseResponseJSON` once on EOF —
+  detected via the wrapper's `Read` method, not on `Close` — so
+  span attributes populate BEFORE httputil's copy loop reports the
+  body as drained. That ordering matters: `FlushInterval=-1` (from
+  A27) streams bytes incrementally to the client, and without
+  the EOF-side parse, a client's `ReadAll` could return before the
+  server-side handler had ended the span. The wrapper uses
+  `sync.Once` to make Close idempotent (httputil, io.NopCloser, and
+  client code all double-close at various points). The same
+  parseOnClose pattern was applied to the 4xx error path so its
+  TeeReader-captured snippet finalizes the span in lock-step with
+  the client's body completion. `info.FirstByteAt = time.Now()`
+  inside `modify` already captured first-byte timestamp accurately;
+  the only thing missing was the bytes-on-the-wire behaviour, which
+  this change delivers.
+  **Evidence:**
+  - `TestNonStreamingFirstByteNotDelayed` — bespoke `net.Listener`
+    upstream writes a JSON response in two halves separated by
+    150ms. Client-side first-byte delta < 100ms (well before the
+    upstream stall completes), confirming stream-through. The same
+    test asserts `gen_ai.usage.input_tokens` is on the span after
+    drain, proving the parse-on-close path still enriches.
+  - `TestProxyEndToEndNonStreaming` (existing) still passes — the
+    `gen_ai.usage.input_tokens` span attribute assertion is the
+    same one the spec calls out as the regression guard.
+  - Full suite green under `-race -count=3`.
 - [ ] **A29 — Content-Length pre-check (item 2.8)** 🟡
 
 ## Low — opportunistic

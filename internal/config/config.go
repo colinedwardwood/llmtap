@@ -111,9 +111,43 @@ type Upstream struct {
 	// forward to this upstream. Above the cap the proxy replies
 	// 429 + Retry-After: 1 without contacting upstream. Zero (default)
 	// disables the cap. The fuse pairs with the per-upstream circuit
-	// breaker (A24, future) — without it, an upstream brownout
-	// consumes every goroutine + memory slice the proxy has.
+	// breaker (A24) — without it, an upstream brownout consumes every
+	// goroutine + memory slice the proxy has.
 	MaxInFlight int `yaml:"max_in_flight"`
+	// PinSHA256 is an optional list of base16-encoded SPKI SHA-256
+	// digests that the upstream's leaf certificate must match. When
+	// non-empty, the proxy installs a TLS VerifyPeerCertificate
+	// callback that rejects any leaf whose SubjectPublicKeyInfo
+	// SHA-256 isn't in the set. Empty list (default) leaves stdlib
+	// chain verification untouched. Each entry must be exactly 64
+	// hex characters (32 bytes).
+	PinSHA256 []string `yaml:"pin_sha256"`
+	// Breaker configures the per-upstream circuit breaker (A24). The
+	// breaker trips after Failures consecutive 5xx responses within
+	// Window; while open, requests short-circuit to 503 +
+	// Retry-After. After RecoveryWindow the breaker enters half-open
+	// and admits exactly one probe. Failures=0 disables the breaker.
+	Breaker BreakerConfig `yaml:"breaker"`
+}
+
+// BreakerConfig is the per-upstream circuit-breaker tuning. Sensible
+// production defaults are Failures=5, Window=30s, RecoveryWindow=15s;
+// the defaults are not applied automatically because zeroing Failures
+// disables the breaker entirely, which is the desired behaviour for
+// the unconfigured case.
+type BreakerConfig struct {
+	// Failures is the count of consecutive 5xx that trips the breaker.
+	// Any non-5xx response (including 4xx) resets the counter. Zero
+	// disables the breaker.
+	Failures int `yaml:"failures"`
+	// Window is the time-bound on the consecutive-failure counter. A
+	// 5xx older than Window relative to the most recent failure does
+	// not contribute. Zero defaults to "no time bound".
+	Window time.Duration `yaml:"window"`
+	// RecoveryWindow is the time the breaker stays open before
+	// allowing one probe request. Zero defaults to Window when set,
+	// else to 15 seconds.
+	RecoveryWindow time.Duration `yaml:"recovery_window"`
 }
 
 // Telemetry controls how llmtap exports its OTel signals.
@@ -332,6 +366,14 @@ func (c *Config) Validate() error {
 		if !strings.HasPrefix(u.Prefix, "/") {
 			errs = append(errs, fmt.Errorf("upstreams[%d].prefix: must start with '/'", i))
 		}
+		// /healthz and /readyz are reserved by the proxy for
+		// unauthenticated probe endpoints. An upstream prefix that
+		// collides (exact or as a sub-path) would mask the probes
+		// or — worse — let an attacker prepend a probe URL to
+		// re-route an authenticated request. Reject at config-load.
+		if isReservedPrefix(u.Prefix) {
+			errs = append(errs, fmt.Errorf("upstreams[%d].prefix %q: collides with reserved health endpoint", i, u.Prefix))
+		}
 		if other, dup := seenPrefix[u.Prefix]; dup {
 			errs = append(errs, fmt.Errorf("upstreams[%d].prefix %q: duplicate of upstream %q", i, u.Prefix, other))
 		} else {
@@ -344,6 +386,20 @@ func (c *Config) Validate() error {
 		case ProviderOpenAI, ProviderAnthropic:
 		default:
 			errs = append(errs, fmt.Errorf("upstreams[%d].provider %q: unsupported (want openai|anthropic)", i, u.Provider))
+		}
+		for j, p := range u.PinSHA256 {
+			if !isHex64(p) {
+				errs = append(errs, fmt.Errorf("upstreams[%d].pin_sha256[%d]: must be 64 hex chars (32-byte SHA-256), got %q", i, j, p))
+			}
+		}
+		if u.Breaker.Failures < 0 {
+			errs = append(errs, fmt.Errorf("upstreams[%d].breaker.failures %d: must be >= 0", i, u.Breaker.Failures))
+		}
+		if u.Breaker.Window < 0 {
+			errs = append(errs, fmt.Errorf("upstreams[%d].breaker.window %v: must be >= 0", i, u.Breaker.Window))
+		}
+		if u.Breaker.RecoveryWindow < 0 {
+			errs = append(errs, fmt.Errorf("upstreams[%d].breaker.recovery_window %v: must be >= 0", i, u.Breaker.RecoveryWindow))
 		}
 	}
 
@@ -432,6 +488,43 @@ func isLoopbackAddr(listen string) bool {
 		return false
 	}
 	return ip.IsLoopback()
+}
+
+// isReservedPrefix reports whether u.Prefix collides with one of the
+// proxy-owned probe endpoints. The collision rule is "exact match or
+// reserved is a prefix of u" — operators can still mount, e.g.,
+// /healthz-internal, but /healthz alone or /healthz/sub is rejected.
+func isReservedPrefix(prefix string) bool {
+	reserved := []string{"/healthz", "/readyz"}
+	for _, r := range reserved {
+		if prefix == r {
+			return true
+		}
+		if strings.HasPrefix(prefix, r+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// isHex64 reports whether s is exactly 64 characters and every
+// character is a valid hex digit. Used to validate operator-supplied
+// SPKI sha256 pin hashes.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Match returns the upstream whose Prefix is the longest match of urlPath, or
