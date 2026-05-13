@@ -51,7 +51,7 @@ jobs:
               -X github.com/colinedwardwood/llmtap/internal/buildinfo.Date=${DATE}" \
             -o "$out" ./cmd/llmtap
           sha256sum "$out" > "${out}.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -123,7 +123,7 @@ jobs:
             name=$(basename "$bin")
             syft file:"$bin" -o cyclonedx-json="sbom-${name}.cdx.json"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sboms
           path: sbom-*.cdx.json
@@ -155,7 +155,7 @@ jobs:
               --output-signature "${bin}.sig" \
               --output-certificate "${bin}.pem"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: signatures
           path: |
