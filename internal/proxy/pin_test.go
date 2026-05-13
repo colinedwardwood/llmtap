@@ -100,22 +100,20 @@ func rebuildClientToTrust(upstream *httptest.Server) *http.Client {
 // TestUpstreamServerNameAlwaysSet asserts the per-upstream Transport
 // pins ServerName to the parsed target's hostname so SNI is
 // deterministic and a swapped DNS entry can't quietly downgrade
-// certificate validation.
+// certificate validation. Uses a synthetic hostname target — the test
+// only reads the Transport configuration, it doesn't dial.
 func TestUpstreamServerNameAlwaysSet(t *testing.T) {
 	t.Parallel()
 
-	cert, _ := generateTestCert(t, "llmtap-upstream-test")
-	upstream, _ := newTLSUpstream(t, cert)
-	defer upstream.Close()
-
-	target, err := url.Parse(upstream.URL)
+	const target = "https://api.example.test:443"
+	parsed, err := url.Parse(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	cfg := config.Default()
 	cfg.Upstreams = []config.Upstream{{
-		Name: "openai", Prefix: "/v1", Target: upstream.URL, Provider: "openai",
+		Name: "openai", Prefix: "/v1", Target: target, Provider: "openai",
 	}}
 
 	h, err := proxy.New(cfg, provider.BuiltIn(), fakeProv(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -134,8 +132,48 @@ func TestUpstreamServerNameAlwaysSet(t *testing.T) {
 	if tr.TLSClientConfig == nil {
 		t.Fatal("TLSClientConfig is nil")
 	}
-	if tr.TLSClientConfig.ServerName != target.Hostname() {
-		t.Errorf("TLSClientConfig.ServerName = %q; want %q", tr.TLSClientConfig.ServerName, target.Hostname())
+	if tr.TLSClientConfig.ServerName != parsed.Hostname() {
+		t.Errorf("TLSClientConfig.ServerName = %q; want %q", tr.TLSClientConfig.ServerName, parsed.Hostname())
+	}
+}
+
+// TestUpstreamTransportSkipsServerNameForIPLiteral is the C10 regression.
+// RFC 6066 §3 forbids IP literals in the TLS SNI extension; some upstreams
+// reject the handshake when one shows up. When target.Hostname() parses as
+// an IP, the Transport's ServerName must be left empty so the stdlib falls
+// back to its IP-based handshake.
+func TestUpstreamTransportSkipsServerNameForIPLiteral(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		target string
+	}{
+		{"ipv4", "https://127.0.0.1:8443"},
+		{"ipv6", "https://[::1]:8443"},
+		{"ipv6-full", "https://[2001:db8::1]:443"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.Default()
+			cfg.Upstreams = []config.Upstream{{
+				Name: "openai", Prefix: "/v1", Target: tc.target, Provider: "openai",
+			}}
+			h, err := proxy.New(cfg, provider.BuiltIn(), fakeProv(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rps := proxy.ReverseProxiesForTest(h)
+			tr, ok := rps["openai"].Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("Transport is not *http.Transport: %T", rps["openai"].Transport)
+			}
+			if got := tr.TLSClientConfig.ServerName; got != "" {
+				t.Errorf("TLSClientConfig.ServerName = %q for IP-literal target %q; want \"\" (SNI not allowed for IP literals)", got, tc.target)
+			}
+		})
 	}
 }
 
