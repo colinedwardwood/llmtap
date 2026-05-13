@@ -94,6 +94,11 @@ http:
   # production). Outbound response writes stay unbounded so streaming
   # LLM responses can legitimately run for minutes.
   body_read_timeout: 30s
+  # cert_reload_interval is how often llmtap re-stats tls.cert_file and
+  # tls.key_file and atomically swaps the served cert when ModTime
+  # advances. This is what makes cert-manager / Let's Encrypt renewals
+  # work without restarting the process. Zero disables hot-reload.
+  cert_reload_interval: 30s
 
 # Inbound request shaping. llmtap buffers up to 1 MiB of every request
 # body for parser-driven enrichment, then forwards the original stream

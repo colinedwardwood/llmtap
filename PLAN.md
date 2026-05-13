@@ -1214,7 +1214,31 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   - `golangci-lint run --timeout=2m ./...` zero issues.
 - [ ] **A18 — Upstream cert pinning (item 1.2)** 🟡
 - [ ] **A19 — `/healthz` / `/readyz` endpoints (item 1.3)** 🟡
-- [ ] **A20 — Shutdown waits on active streams (item 1.4)** 🟡
+- [x] **A20 — Shutdown waits on active streams (item 1.4)** 🟡
+  **Finding:** `Handler.activeStreams` was incremented in `WrapStream`
+  and decremented in the onClose callback, but nothing observed it
+  during shutdown. `http.Server.Shutdown` waits for `ServeHTTP` to
+  return — and the SSE handler returns the moment ReverseProxy starts
+  writing the response, well before the stream-parser side has run
+  its finalize. Metric emission and span End for the dominant
+  streaming case were getting raced against process exit.
+  **Fix:** New `Handler.WaitForStreams(ctx) int64` method polls
+  `activeStreams.Load()` on a 50ms ticker until either the counter
+  reaches zero or ctx expires; returns whatever's still in flight at
+  return time. `Server.Run`'s shutdown branch now calls
+  `WaitForStreams(shutCtx)` BEFORE `server.Shutdown(shutCtx)`, sharing
+  the same `ShutdownTimeout` budget. A non-zero remainder logs WARN
+  with the count and proceeds — never blocks past the budget. The
+  `Server` struct now holds a `*Handler` reference (passed through
+  `NewServer`) so it can reach the counter; this is the only
+  structural change.
+  **Evidence:**
+  - `TestShutdownWaitsForActiveStreams`: a fake upstream pauses
+    mid-stream on a `release chan struct{}`. The test fires a real
+    request through `proxy.NewServer.Run` (goroutine), cancels the
+    context, and asserts `Run` is STILL blocked 150ms after cancel
+    (would have returned ~immediately pre-fix). Closing `release`
+    lets the stream onClose fire; `Run` returns within the deadline.
 - [x] **A21 — SSE `\r\n\r\n` / `\r\r` framing (item 1.11)** 🟡
   **Evidence:** `sse.go` `drain` no longer hard-codes `\n\n`. New
   `findFrameBoundary` scans for any of `\r\n\r\n`, `\n\n`, or `\r\r`
@@ -1230,7 +1254,6 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   `\r\n\r\n`, and `\r\r` dispatches three distinct events). Before
   the fix the CRLF case dispatched ONE event (one giant concatenated
   blob); after, three events.
-
 - [x] **A22 — Strict operation-path matching (item 1.12)** 🟡
   **Evidence:** `OperationFor` in both `openai.go` and `anthropic.go`
   replaces `strings.HasSuffix` with segment-aware matching via a
@@ -1246,7 +1269,52 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
   legitimate paths (`/v1/chat/completions`, `/openai/v1/embeddings`,
   `/openai/deployments/my-gpt-4o/chat/completions`,
   `/v1/messages`) still map to their operations.
-- [ ] **A23 — Hot certificate reload (item 2.1)** 🟡
+- [x] **A23 — Hot certificate reload (item 2.1)** 🟡
+  **Finding:** `srv.ServeTLS(ln, certFile, keyFile)` loads the keypair
+  exactly once at boot. Cert-manager / Let's Encrypt renewals that
+  overwrite the on-disk files were sitting unread until the process
+  restarted — turning every renewal into either a planned restart or
+  an outage when the old cert quietly expired.
+  **Fix:** New `internal/proxy/certmgr.go`:
+  - `certManager` holds `*tls.Certificate` behind
+    `atomic.Pointer[tls.Certificate]`. `Get(*tls.ClientHelloInfo)`
+    implements `tls.Config.GetCertificate` so a fresh swap is visible
+    to the very next handshake (no listener drop).
+  - `Load(certPath, keyPath)` parses the pair, populates `Leaf`, and
+    stores it atomically. Idempotent; safe to call concurrently.
+  - `checkAndReload(logger)` (factored out for synchronous testing)
+    polls `os.Stat` on both files, compares ModTime against
+    `lastCertMod`/`lastKeyMod` atomic counters, reloads on change. A
+    failed reload leaves the previous cert active — we never trade
+    a working cert for a broken one.
+  - `Watch(ctx, interval, logger)` runs `checkAndReload` on a ticker
+    until ctx cancels. Each successful reload logs the loaded leaf's
+    SHA-256 so an operator can confirm the swap took effect.
+  `buildTLSConfig` now installs `GetCertificate: mgr.Get`. `Server.Run`
+  starts the watcher goroutine before `Serve` (watcher ctx tied to the
+  same ctx that gates shutdown) and calls `ServeTLS(ln, "", "")` —
+  empty paths route resolution through `GetCertificate` instead of
+  `LoadX509KeyPair` at boot. New `HTTPTimeouts.CertReloadInterval`
+  config field (default 30s; 0 disables) gates the watcher.
+  **Evidence:**
+  - `TestCertManagerReloadsOnModTimeChange`: writes cert v1, asserts
+    v1 fingerprint, overwrites v1's paths with v2's contents +
+    `os.Chtimes` to advance ModTime, calls `checkAndReload` once,
+    asserts v2 fingerprint and that `Get` returns the new DER bytes.
+  - `TestCertManagerLoadFailureKeepsPreviousCert`: corrupts the cert
+    file on disk and confirms the in-memory cert remains v1 — a
+    partial write from a renewer mid-flight does not blank the
+    served cert.
+  - `TestServerRunServesFreshlyLoadedCert`: stands up a real
+    `proxy.NewServer.Run` over TLS with a fresh self-signed pair,
+    opens a `tls.Dial` against it, pins the SHA-256 of the presented
+    leaf against the cert-on-disk fingerprint. Proves the cert
+    served by `ServeTLS(ln, "", "")` came from the cert manager (not
+    from a stdlib LoadX509KeyPair on stale bytes).
+  - `writeSelfSignedCertKey(t, sub)` factored as a per-test helper
+    returning `(certPath, keyPath, spkiSHA)` so future cert-related
+    tests get fresh, fingerprintable pairs without reinventing the
+    helper.
 - [ ] **A24 — Circuit breaker per upstream (item 2.2)** 🟡
 - [x] **A25 — OTel module version alignment (item 2.4)** 🟡 *(closed incidentally via A15 dep bumps to v1.43.0)*
 - [x] **A26 — Tool-call streaming coverage (item 2.5)** 🟡

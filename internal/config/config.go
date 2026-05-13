@@ -162,6 +162,12 @@ type HTTPTimeouts struct {
 	// (pre-A11 behaviour). Default 30 s tolerates legitimately large
 	// multimodal uploads while killing slowloris-style holds.
 	BodyReadTimeout time.Duration `yaml:"body_read_timeout"`
+	// CertReloadInterval is how often the cert manager polls the cert /
+	// key files for ModTime changes and reloads them in place. Zero
+	// disables hot-reload (one-shot load at boot, restart for rotation).
+	// Default 30 s is short enough to catch cert-manager renewals
+	// quickly, long enough to be invisible in stat noise.
+	CertReloadInterval time.Duration `yaml:"cert_reload_interval"`
 }
 
 // Service identifies llmtap to the OTel backend (resource attributes).
@@ -205,10 +211,11 @@ func Default() Config {
 		},
 		Content: ContentCapture{Mode: CaptureOff, Redact: "default"},
 		HTTP: HTTPTimeouts{
-			ReadHeaderTimeout: 30 * time.Second,
-			IdleTimeout:       120 * time.Second,
-			ShutdownTimeout:   30 * time.Second,
-			BodyReadTimeout:   30 * time.Second,
+			ReadHeaderTimeout:  30 * time.Second,
+			IdleTimeout:        120 * time.Second,
+			ShutdownTimeout:    30 * time.Second,
+			BodyReadTimeout:    30 * time.Second,
+			CertReloadInterval: 30 * time.Second,
 		},
 		Service: Service{
 			Name:      "llmtap",

@@ -578,3 +578,36 @@ func (h *Handler) WrapWithOTel(routeName string) http.Handler {
 		}),
 	)
 }
+
+// WaitForStreams blocks until the in-flight stream counter reaches zero or
+// ctx expires. It returns the remaining count at return time (0 = clean
+// drain, >0 = ctx deadline reached with that many streams still open).
+//
+// http.Server.Shutdown waits for the response handler goroutines it spawns
+// to return, but our SSE responses run their finalize from an onClose
+// callback inside the response body wrapper — Shutdown sees the handler
+// goroutine as "returned" the moment ServeHTTP exits, even though the
+// stream is still actively writing bytes. Polling activeStreams closes
+// that gap: shutdown only proceeds once the parser side of every stream
+// has actually drained (or we hit the deadline).
+//
+// 50ms is a deliberate cadence: tight enough that a fast-finishing stream
+// doesn't make Shutdown's deadline budget feel sluggish, loose enough not
+// to consume measurable CPU during a long graceful-shutdown window.
+func (h *Handler) WaitForStreams(ctx context.Context) int64 {
+	if n := h.activeStreams.Load(); n == 0 {
+		return 0
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return h.activeStreams.Load()
+		case <-ticker.C:
+			if n := h.activeStreams.Load(); n == 0 {
+				return 0
+			}
+		}
+	}
+}
