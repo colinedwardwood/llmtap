@@ -1497,14 +1497,14 @@ Legend: 🔴 Critical/High · 🟡 Medium · 🟢 Low
 
 ## Low — opportunistic
 
-- [ ] LLMTAP_OTLP_HEADERS env (item 1.8) 🟢
-- [ ] LLMTAP_SAMPLE_RATIO env (item 1.9) 🟢
-- [ ] Cost as histogram (item 2.3) 🟢
-- [ ] Pricing trie lookup (item 2.9) 🟢
-- [ ] SECURITY.md + Dependabot (item 3.3) 🟢
-- [ ] Documentation honesty pass (item 3.4) 🟢
-- [ ] `runtime/debug.ReadBuildInfo` fallback (item 3.5) 🟢
-- [ ] Load test harness (item 3.6) 🟢
+- [x] LLMTAP_OTLP_HEADERS env (item 1.8) 🟢 — `TestEnvOverridesOTLPHeaders`.
+- [x] LLMTAP_SAMPLE_RATIO env (item 1.9) 🟢 — `TestEnvOverridesSampleRatio` (in-range + clamp paths).
+- [x] Cost as histogram (item 2.3) 🟢 — `gen_ai.client.cost.usd` now a histogram with USD-scaled buckets; sibling `gen_ai.client.cost.usd.total` counter for cumulative spend.
+- [x] Pricing trie lookup (item 2.9) 🟢 — O(K) byte-trie; `BenchmarkPricingLookup` reports 168 ns/op @ N=500 (budget 200 ns).
+- [x] SECURITY.md + Dependabot (item 3.3) 🟢 — Private disclosure mailbox, 90-day window, cosign verification instructions; weekly gomod/github-actions/docker Dependabot scans with OTel and google.golang.org/* grouped together.
+- [x] Documentation honesty pass (item 3.4) 🟢 — README walked against the post-A28 reality: TLS demo, env-var table, structural-config block, histogram metric, redaction profiles, architecture diagram, performance section all updated.
+- [x] `runtime/debug.ReadBuildInfo` fallback (item 3.5) 🟢 — `buildinfo.Resolve()` upgrades unset linker-X values from `debug.BuildInfo` so `go install …@v0.1.3` users get a real version string.
+- [x] Load test harness (item 3.6) 🟢 — `test/load/load_test.go` (Go-native, no external tools), `make load-test`, dedicated CI job. Asserts p99 added latency, zero 5xx, no goroutine leak. Local p99-baseline=1.33ms over 2000 requests.
 
 ## Execution order
 
