@@ -19,7 +19,7 @@ import (
 
 func TestBuildTLSConfigNoClientCA(t *testing.T) {
 	t.Parallel()
-	cfg, err := buildTLSConfig(config.TLS{CertFile: "x", KeyFile: "y"})
+	cfg, err := buildTLSConfig(config.TLS{CertFile: "x", KeyFile: "y"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestBuildTLSConfigWithClientCA(t *testing.T) {
 		CertFile:     "x",
 		KeyFile:      "y",
 		ClientCAFile: caPath,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestBuildTLSConfigInvalidClientCA(t *testing.T) {
 		CertFile:     "x",
 		KeyFile:      "y",
 		ClientCAFile: bad,
-	}); err == nil {
+	}, nil); err == nil {
 		t.Fatal("expected error for non-PEM client CA file")
 	}
 
@@ -71,7 +71,7 @@ func TestBuildTLSConfigInvalidClientCA(t *testing.T) {
 		CertFile:     "x",
 		KeyFile:      "y",
 		ClientCAFile: filepath.Join(dir, "missing.pem"),
-	}); err == nil {
+	}, nil); err == nil {
 		t.Fatal("expected error for missing client CA file")
 	}
 }
