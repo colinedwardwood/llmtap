@@ -14,7 +14,6 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -37,20 +36,64 @@ type Table struct {
 	// preserves O(1) system membership and supports the merge path
 	// in Load.
 	rates map[string]map[string]Rate
-	// sorted is the deterministic walk order for lookup, built once
-	// at construction time. Per-system, prefixes are ordered by
-	// length (descending) and then lexicographically (ascending);
-	// the first match wins. This removes the latent dependence on
-	// Go's randomized map iteration order in the cost-computation
-	// data path.
-	sorted map[string][]prefixedRate
+	// trees is the per-system lookup index. Each `*trieNode` is the
+	// root of a byte-trie of every prefix configured for that system,
+	// terminating in a Rate at the matching node. Lookup walks at most
+	// `len(model)` byte transitions and records the deepest
+	// rate-bearing node seen — that's the longest matching prefix in
+	// O(K) time, with deterministic ordering by construction (the
+	// trie has no concept of map-iteration order).
+	trees map[string]*trieNode
 }
 
-// prefixedRate is a (prefix, rate) pair held in the per-system sorted
-// walk order. Kept private; the only consumer is Table.lookup.
-type prefixedRate struct {
-	prefix string
-	rate   Rate
+// trieNode is a node in a per-system prefix trie. Children are held in
+// a map keyed by byte so the memory footprint stays proportional to
+// the actual character set in use (catalogues are ASCII-only today;
+// a switch to a fixed [128]*trieNode array would be slightly faster
+// but blow up memory for sparse children).
+type trieNode struct {
+	children map[byte]*trieNode
+	rate     *Rate // non-nil if a configured prefix terminates here
+}
+
+func (n *trieNode) insert(prefix string, rate Rate) {
+	cur := n
+	for i := 0; i < len(prefix); i++ {
+		c := prefix[i]
+		if cur.children == nil {
+			cur.children = make(map[byte]*trieNode)
+		}
+		next, ok := cur.children[c]
+		if !ok {
+			next = &trieNode{}
+			cur.children[c] = next
+		}
+		cur = next
+	}
+	r := rate
+	cur.rate = &r
+}
+
+func (n *trieNode) lookup(model string) (Rate, bool) {
+	var best *Rate
+	cur := n
+	for i := 0; i < len(model); i++ {
+		if cur.rate != nil {
+			best = cur.rate
+		}
+		next, ok := cur.children[model[i]]
+		if !ok {
+			break
+		}
+		cur = next
+	}
+	if cur.rate != nil {
+		best = cur.rate
+	}
+	if best == nil {
+		return Rate{}, false
+	}
+	return *best, true
 }
 
 // defaultTable is the embedded built-in catalogue. It is constructed
@@ -67,24 +110,18 @@ func init() {
 }
 
 // newTable builds a Table from a parsed (system, prefix, rate) map and
-// precomputes the deterministic per-system walk order. Construction
-// allocates; lookups are read-only and lock-free.
+// precomputes a per-system byte-trie. Construction allocates; lookups
+// are read-only and lock-free.
 func newTable(rates map[string]map[string]Rate) *Table {
-	sorted := make(map[string][]prefixedRate, len(rates))
+	trees := make(map[string]*trieNode, len(rates))
 	for sys, models := range rates {
-		entries := make([]prefixedRate, 0, len(models))
+		root := &trieNode{}
 		for prefix, rate := range models {
-			entries = append(entries, prefixedRate{prefix: prefix, rate: rate})
+			root.insert(prefix, rate)
 		}
-		sort.Slice(entries, func(i, j int) bool {
-			if len(entries[i].prefix) != len(entries[j].prefix) {
-				return len(entries[i].prefix) > len(entries[j].prefix)
-			}
-			return entries[i].prefix < entries[j].prefix
-		})
-		sorted[sys] = entries
+		trees[sys] = root
 	}
-	return &Table{rates: rates, sorted: sorted}
+	return &Table{rates: rates, trees: trees}
 }
 
 // Default returns the embedded built-in pricing catalogue. The returned
@@ -156,21 +193,11 @@ func (t *Table) Cost(system, model string, inputTokens, outputTokens int64) (usd
 }
 
 func (t *Table) lookup(system, model string) (Rate, bool) {
-	entries, ok := t.sorted[system]
+	root, ok := t.trees[system]
 	if !ok {
 		return Rate{}, false
 	}
-	model = strings.ToLower(model)
-	// entries is pre-sorted (length desc, then prefix asc); the first
-	// HasPrefix hit is the longest-prefix winner with a stable
-	// lexicographic tiebreak — no map-iteration order in the data
-	// path.
-	for _, e := range entries {
-		if strings.HasPrefix(model, e.prefix) {
-			return e.rate, true
-		}
-	}
-	return Rate{}, false
+	return root.lookup(strings.ToLower(model))
 }
 
 // Cost is a backwards-compatible package-level alias that resolves
