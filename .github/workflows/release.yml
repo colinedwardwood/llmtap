@@ -243,8 +243,26 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Download only the artifacts the release actually ships. The
+      # `.dockerbuild` blob that docker/build-push-action uploads by
+      # default is a BuildKit metadata record we don't redistribute,
+      # and including it in the bulk-download has been intermittently
+      # flaky across re-runs.
       - uses: actions/download-artifact@v4
         with:
+          pattern: bin-*
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: sboms
+          path: dist/sboms
+      - uses: actions/download-artifact@v4
+        with:
+          name: signatures
+          path: dist/signatures
+      - uses: actions/download-artifact@v4
+        with:
+          name: multiple.intoto.jsonl
           path: dist
       - name: Flatten artifacts
         run: |
