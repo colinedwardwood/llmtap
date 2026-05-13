@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -44,8 +45,21 @@ func newCertManager(certPath, keyPath string) *certManager {
 
 // Load reads cert + key from disk, parses them, and atomically installs
 // the result. Idempotent and safe to call concurrently with Get.
+//
+// Two-file rotation hazard (C4): cert-manager and the Kubernetes
+// ConfigMap projector rewrite cert and key as independent files. A
+// naive `tls.LoadX509KeyPair` reads them in two separate syscalls and
+// can splice old-cert / new-key (or vice versa) when a rotation lands
+// between the reads. The spliced pair fails handshakes — at best — or
+// silently presents the wrong identity if the keys happen to match.
+//
+// loadAtomicPair below addresses this with a read-then-restat barrier:
+// any ModTime advance between the bytes-read and the re-stat is treated
+// as a torn read and retried. `tls.X509KeyPair` also internally
+// verifies public/private key consistency, so any inconsistency that
+// slips past the ModTime check surfaces as a parse error.
 func (m *certManager) Load(certPath, keyPath string) error {
-	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	pair, certMod, keyMod, err := loadAtomicPair(certPath, keyPath)
 	if err != nil {
 		return fmt.Errorf("load keypair (%s, %s): %w", certPath, keyPath, err)
 	}
@@ -59,14 +73,80 @@ func (m *certManager) Load(certPath, keyPath string) error {
 		}
 	}
 	m.cert.Store(&pair)
-
-	if st, statErr := os.Stat(certPath); statErr == nil {
-		m.lastCertMod.Store(st.ModTime().UnixNano())
-	}
-	if st, statErr := os.Stat(keyPath); statErr == nil {
-		m.lastKeyMod.Store(st.ModTime().UnixNano())
-	}
+	m.lastCertMod.Store(certMod)
+	m.lastKeyMod.Store(keyMod)
 	return nil
+}
+
+// loadAtomicMaxAttempts caps the torn-read retry. Three attempts cover
+// the worst realistic case (writer rewrites both files in two
+// non-overlapping syscalls); beyond that, something pathological is
+// happening on the filesystem and we should surface the error rather
+// than spin.
+const loadAtomicMaxAttempts = 3
+
+// loadAtomicPair reads cert + key consistently. On each attempt:
+//
+//  1. Stat cert and key (record ModTime baseline).
+//  2. Read cert bytes, then key bytes.
+//  3. Re-stat cert and key.
+//  4. If either ModTime advanced between (1) and (3), the bytes are
+//     potentially torn — retry.
+//  5. tls.X509KeyPair verifies pub/priv consistency; a "private key
+//     does not match" error is the classic torn-read signature and
+//     also triggers a retry.
+//
+// Returns the parsed keypair and the ModTimes-as-of-the-successful-read
+// so callers can store them as the "last known good" baseline.
+func loadAtomicPair(certPath, keyPath string) (tls.Certificate, int64, int64, error) {
+	var lastErr error
+	for attempt := 0; attempt < loadAtomicMaxAttempts; attempt++ {
+		certStat0, err := os.Stat(certPath)
+		if err != nil {
+			return tls.Certificate{}, 0, 0, fmt.Errorf("stat cert: %w", err)
+		}
+		keyStat0, err := os.Stat(keyPath)
+		if err != nil {
+			return tls.Certificate{}, 0, 0, fmt.Errorf("stat key: %w", err)
+		}
+		certBytes, err := os.ReadFile(certPath)
+		if err != nil {
+			return tls.Certificate{}, 0, 0, fmt.Errorf("read cert: %w", err)
+		}
+		keyBytes, err := os.ReadFile(keyPath)
+		if err != nil {
+			return tls.Certificate{}, 0, 0, fmt.Errorf("read key: %w", err)
+		}
+		certStat1, err := os.Stat(certPath)
+		if err != nil {
+			return tls.Certificate{}, 0, 0, fmt.Errorf("re-stat cert: %w", err)
+		}
+		keyStat1, err := os.Stat(keyPath)
+		if err != nil {
+			return tls.Certificate{}, 0, 0, fmt.Errorf("re-stat key: %w", err)
+		}
+		if !certStat0.ModTime().Equal(certStat1.ModTime()) || !keyStat0.ModTime().Equal(keyStat1.ModTime()) {
+			lastErr = errors.New("cert/key rotated mid-read; retrying")
+			continue
+		}
+		pair, err := tls.X509KeyPair(certBytes, keyBytes)
+		if err != nil {
+			// X509KeyPair surfaces pub/priv mismatch via this exact
+			// wording (see crypto/tls.X509KeyPair). Retry it; let
+			// other PEM-parse errors propagate immediately since
+			// they're persistent.
+			if strings.Contains(err.Error(), "private key does not match public key") {
+				lastErr = err
+				continue
+			}
+			return tls.Certificate{}, 0, 0, fmt.Errorf("parse keypair: %w", err)
+		}
+		return pair, certStat1.ModTime().UnixNano(), keyStat1.ModTime().UnixNano(), nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("unknown torn-read failure")
+	}
+	return tls.Certificate{}, 0, 0, fmt.Errorf("consistent keypair load failed after %d attempts: %w", loadAtomicMaxAttempts, lastErr)
 }
 
 // Get implements tls.Config.GetCertificate. Returns the currently cached

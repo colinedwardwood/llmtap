@@ -219,6 +219,50 @@ func TestCertManagerLoadFailureKeepsPreviousCert(t *testing.T) {
 	}
 }
 
+// TestCertManagerRejectsMismatchedCertAndKey is the C4 regression. A
+// torn read across the cert and key files (cert is v2, key is still v1)
+// would splice the wrong keypair and either silently present a stale
+// identity or fail handshakes mid-flight. loadAtomicPair must catch
+// this via tls.X509KeyPair's pub/priv check and refuse to install the
+// mismatched pair; the previous in-memory cert stays active.
+func TestCertManagerRejectsMismatchedCertAndKey(t *testing.T) {
+	t.Parallel()
+
+	cert1, key1, sha1 := writeSelfSignedCertKey(t, "stable")
+	cert2, _, sha2 := writeSelfSignedCertKey(t, "rotated")
+	if sha1 == sha2 {
+		t.Fatal("test setup: cert fingerprints collided")
+	}
+
+	mgr := newCertManager(cert1, key1)
+	if err := mgr.Load(cert1, key1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Splice: overwrite cert1's PEM with cert2's PEM but leave key1
+	// untouched. This is exactly the artifact a torn read across the
+	// two files would produce.
+	c2, err := os.ReadFile(cert2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cert1, c2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(cert1, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := mgr.checkAndReload(logger); err == nil {
+		t.Fatal("expected mismatched cert/key to be rejected")
+	}
+	if got := mgr.leafFingerprint(); got != sha1 {
+		t.Fatalf("mismatched load clobbered active cert: got %s, want %s", got, sha1)
+	}
+}
+
 // TestServerRunServesFreshlyLoadedCert is the integration regression
 // test for A23: a real Server.Run serving over TLS must hand back the
 // CURRENT cert from the cert manager — not a cert frozen at boot. We
