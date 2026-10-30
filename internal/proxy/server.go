@@ -60,6 +60,9 @@ func NewServer(cfg config.Config, h *Handler, logger *slog.Logger) (*Server, err
 			return nil, fmt.Errorf("tls: %w", err)
 		}
 		srv.TLSConfig = tlsCfg
+		// Seed the NotAfter gauge and warn if the boot cert is close
+		// to expiry — silent age-into-outage was MANDATORY M11.
+		h.observeCert(certMgr.leafNotAfter(), logger)
 	}
 
 	return &Server{
@@ -125,7 +128,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// in the first 30s after boot still picks up. The watcher exits when
 	// ctx is cancelled, so it lives exactly as long as Run does.
 	if s.certMgr != nil && s.certReloadEvery > 0 {
-		go s.certMgr.Watch(ctx, s.certReloadEvery, s.logger)
+		go s.certMgr.Watch(ctx, s.certReloadEvery, s.logger, s.handler)
 	}
 
 	errCh := make(chan error, 1)
@@ -151,20 +154,36 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		s.logger.InfoContext(ctx, "shutdown requested")
+		// Flip /readyz to 503 immediately so the load balancer
+		// stops sending new traffic before we start draining
+		// (k8s: pair with readinessProbe + preStop / grace period).
+		if s.handler.beginDrain != nil {
+			s.handler.beginDrain()
+		}
 		shutCtx, cancel := context.WithTimeout(context.Background(), s.timeout)
 		defer cancel()
-		// Drain active SSE streams before Shutdown sweeps connections.
+		// Shutdown FIRST (concurrently): it closes the listener so no
+		// new work arrives, then waits for in-flight handlers. The old
+		// order — WaitForStreams before Shutdown — drained streams
+		// while the listener was still accepting, so under sustained
+		// traffic activeStreams never reached zero, the entire budget
+		// burned, and Shutdown then ran with an expired context: a
+		// hard kill for everything, including short requests that
+		// would have drained in milliseconds.
+		shutdownErr := make(chan error, 1)
+		go func() { shutdownErr <- s.server.Shutdown(shutCtx) }()
+		// Drain active SSE streams in parallel on the same budget.
 		// Shutdown waits for ServeHTTP to return, but the SSE wrappers
 		// run their finalize from a body-close callback that races
 		// independently of the response-handler goroutine. Polling
 		// activeStreams gives that finalize a chance to record its
-		// metrics / end its span before we yank the connection.
+		// metrics / end its span before the connection sweep.
 		if remaining := s.handler.WaitForStreams(shutCtx); remaining > 0 {
 			s.logger.WarnContext(shutCtx, "shutdown timeout reached with streams still in flight",
 				slog.Int64("remaining", remaining),
 			)
 		}
-		if err := s.server.Shutdown(shutCtx); err != nil {
+		if err := <-shutdownErr; err != nil {
 			return fmt.Errorf("graceful shutdown: %w", err)
 		}
 		return nil

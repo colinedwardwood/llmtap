@@ -9,3 +9,11 @@ import "net/http/httputil"
 func ReverseProxiesForTest(h *Handler) map[string]*httputil.ReverseProxy {
 	return h.rps
 }
+
+// ActiveStreamsForTest returns the in-process active SSE stream count.
+func ActiveStreamsForTest(h *Handler) int64 {
+	if h == nil {
+		return 0
+	}
+	return h.activeStreams.Load()
+}

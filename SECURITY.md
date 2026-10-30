@@ -51,8 +51,8 @@ and request an extension explicitly — never silently.
   that the operator is accepting the trade-off).
 - Denial-of-service from a configured upstream returning malicious
   bytes. The proxy has bounded buffers, body deadlines, concurrency
-  caps, and circuit breakers (see `PLAN.md` A11–A13, A24), but a
-  determined upstream can still consume operator-side resources;
+  caps, and per-upstream circuit breakers, but a determined
+  upstream can still consume operator-side resources;
   that's an upstream-trust question, not a vulnerability.
 
 ## What we'll do

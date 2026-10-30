@@ -8,16 +8,26 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on force-push / rapid re-push; keep main pushes
+# sequential (they gate merges, not iteration speed).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   GO_VERSION: "1.26"
 
+# Third-party (and first-party) actions are pinned to full commit SHAs —
+# tags are mutable and a retagged action runs with this workflow's
+# permissions. The trailing comment records the human-readable version;
+# Dependabot updates SHA pins in place. (D1)
 jobs:
   test:
     name: test (-race)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -29,30 +39,55 @@ jobs:
             -coverprofile=coverage.out \
             ./...
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage
           path: coverage.out
-      - name: Enforce 60% line coverage on internal/
-        # Current floor is 60%; raise to 70% once telemetry/* and the
-        # untested config loaders get test backfill (tracked separately).
+      - name: Enforce 70% line coverage on internal/
         run: |
           go tool cover -func=coverage.out | tee coverage.txt
           pct=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $NF); print $NF}')
           echo "total coverage: ${pct}%"
-          awk -v p="$pct" 'BEGIN { exit (p+0 < 60.0) }' \
-            || { echo "::error::coverage ${pct}% < 60% gate"; exit 1; }
+          awk -v p="$pct" 'BEGIN { exit (p+0 < 70.0) }' \
+            || { echo "::error::coverage ${pct}% < 70% gate"; exit 1; }
+          fail=0
+          for spec in "auth:55" "config:65" "provider:50" "proxy:55" "redact:70" "telemetry:45"; do
+            dir=${spec%%:*}
+            min=${spec##*:}
+            avg=$(go tool cover -func=coverage.out | grep "/internal/${dir}/" | awk '{gsub(/%/,"",$NF); sum+=$NF; n++} END { if (n) printf "%.1f", sum/n; else print "0" }')
+            echo "internal/${dir} avg coverage: ${avg}% (floor ${min}%)"
+            awk -v p="$avg" -v m="$min" 'BEGIN { exit (p+0 >= m+0) }' || {
+              echo "::error::internal/${dir} avg coverage ${avg}% < ${min}%"
+              fail=1
+            }
+          done
+          exit $fail
+
+  fuzz:
+    name: fuzz (short)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go fuzz (30s per target)
+        run: |
+          go test ./internal/redact/ -fuzz=FuzzRedactIdempotent -fuzztime=30s -count=1
+          go test ./internal/auth/ -fuzz=FuzzHasValidShape -fuzztime=15s -count=1
+          go test ./internal/config/ -fuzz=FuzzParseTokensFile -fuzztime=15s -count=1
 
   lint:
     name: lint (golangci-lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - uses: golangci/golangci-lint-action@v7
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
           # v2.x understands the project's v2-schema .golangci.yml.
           version: v2.12.2
@@ -62,13 +97,15 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # Version-pinned so the scan is reproducible across re-runs;
+        # bumped deliberately, not implicitly via @latest. (D2)
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
       - name: govulncheck ./...
         run: govulncheck ./...
 
@@ -76,9 +113,9 @@ jobs:
     name: trivy fs (HIGH/CRITICAL)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -90,8 +127,8 @@ jobs:
     name: load test (p99 added latency)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -120,8 +157,8 @@ jobs:
           - goos: darwin
             goarch: arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -133,7 +170,9 @@ jobs:
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
           COMMIT=$(git rev-parse --short HEAD)
-          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Commit timestamp, not wall clock: two builds of the same
+          # commit produce the same embedded date. (D3)
+          DATE=$(git log -1 --format=%cI)
           out="llmtap-${GOOS}-${GOARCH}"
           go build -trimpath \
             -ldflags "-s -w \
@@ -142,7 +181,31 @@ jobs:
               -X github.com/colinedwardwood/llmtap/internal/buildinfo.Date=${DATE}" \
             -o "${out}" ./cmd/llmtap
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: llmtap-${{ matrix.goos }}-${{ matrix.goarch }}
           path: llmtap-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  # PR-time image build so a broken Dockerfile surfaces here, not at
+  # release-tag time when half the artifacts are already published. No
+  # push, single arch — the release workflow covers multi-arch. (D4)
+  docker:
+    name: docker build (PR smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: docker build
+        run: docker build --build-arg VERSION=ci --build-arg COMMIT=${GITHUB_SHA::7} -t llmtap:ci .
+
+  # End-to-end demo-stack proof: compose up with a stub upstream, one
+  # proxied request, then assert token + cost series exist in
+  # Prometheus. Guards the README quick start against pipeline rot
+  # (metric renames, collector config drift, dashboard datasource
+  # breakage all surface here). (D12)
+  compose-smoke:
+    name: compose smoke (proxy → prometheus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: run smoke test
+        run: ./test/smoke/smoke.sh

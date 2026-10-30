@@ -49,6 +49,10 @@ func realMeterProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecor
 	if err != nil {
 		t.Fatal(err)
 	}
+	ttfb, err := meter.Float64Histogram("gen_ai.server.time_to_first_byte")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cost, err := meter.Float64Histogram("gen_ai.client.cost.usd")
 	if err != nil {
 		t.Fatal(err)
@@ -64,6 +68,7 @@ func realMeterProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecor
 			TokenUsage:        tokens,
 			OperationDuration: dur,
 			TimeToFirstToken:  ttft,
+			TimeToFirstByte:   ttfb,
 			CostUSD:           cost,
 			CostUSDTotal:      costTotal,
 		},

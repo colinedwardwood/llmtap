@@ -1,0 +1,20 @@
+llmtap
+Copyright 2024-2026 Colin Wood
+
+Licensed under the MIT License (see LICENSE).
+
+This distribution includes third-party open-source components. The
+Go module dependencies are recorded in go.mod / go.sum. Notable
+runtime dependencies include:
+
+  - OpenTelemetry Go SDK and exporters (Apache-2.0)
+  - golang.org/x/crypto (BSD-3-Clause)
+  - gopkg.in/yaml.v3 (Apache-2.0 / MIT)
+
+Full dependency licenses are available via:
+
+  go mod download
+  go list -m -json all
+
+Release artifacts may also ship sbom.spdx.json (Syft) produced by the
+release workflow.

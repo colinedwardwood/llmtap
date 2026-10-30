@@ -1,0 +1,19 @@
+{
+  "responseId": "fixture-response",
+  "modelVersion": "gemini-2.5-pro-001",
+  "candidates": [
+    {
+      "finishReason": "STOP",
+      "content": {
+        "role": "model",
+        "parts": [{"text": "fixture response"}]
+      }
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 12,
+    "candidatesTokenCount": 4,
+    "cachedContentTokenCount": 2,
+    "thoughtsTokenCount": 1
+  }
+}

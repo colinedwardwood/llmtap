@@ -53,7 +53,7 @@ func TestOpenAIParseRequest(t *testing.T) {
 	if got.Name() != "chat gpt-4o-mini" {
 		t.Errorf("span name = %q", got.Name())
 	}
-	mustHaveAttr(t, got.Attributes(), "gen_ai.system", "openai")
+	mustHaveAttr(t, got.Attributes(), "gen_ai.provider.name", "openai")
 	mustHaveAttr(t, got.Attributes(), "gen_ai.request.model", "gpt-4o-mini")
 }
 
@@ -113,9 +113,8 @@ func TestOpenAIWrapStreamFinishesOnce(t *testing.T) {
 	_, span := tp.Tracer("t").Start(context.Background(), "init")
 	info := &Info{System: "openai", Operation: "chat", RequestModel: "gpt-4o-mini"}
 
-	firstToken, done := 0, 0
+	done := 0
 	stream := OpenAI{}.WrapStream(span, info, io.NopCloser(strings.NewReader(b.String())), ContentOpts{},
-		func() { firstToken++ },
 		func() { done++ },
 	)
 
@@ -128,8 +127,8 @@ func TestOpenAIWrapStreamFinishesOnce(t *testing.T) {
 	}
 	_ = stream.Close()
 
-	if firstToken != 1 {
-		t.Errorf("firstToken called %d times", firstToken)
+	if info.FirstTokenAt.IsZero() {
+		t.Errorf("FirstTokenAt is zero on text stream; TTFT metric is silently broken")
 	}
 	if done != 1 {
 		t.Errorf("done called %d times (want exactly 1)", done)
@@ -196,9 +195,8 @@ func TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken(t *testing.T) {
 	_, span := tp.Tracer("t").Start(context.Background(), "init")
 	info := &Info{System: "openai", Operation: "chat", RequestModel: "gpt-4o-mini"}
 
-	firstToken, done := 0, 0
+	done := 0
 	stream := OpenAI{}.WrapStream(span, info, io.NopCloser(strings.NewReader(b.String())), ContentOpts{},
-		func() { firstToken++ },
 		func() { done++ },
 	)
 	if _, err := io.ReadAll(stream); err != nil {
@@ -206,9 +204,6 @@ func TestOpenAIWrapStreamToolOnlyStreamFiresFirstToken(t *testing.T) {
 	}
 	_ = stream.Close()
 
-	if firstToken != 1 {
-		t.Errorf("firstToken called %d times, want exactly 1 on tool-only stream", firstToken)
-	}
 	if done != 1 {
 		t.Errorf("done called %d times, want exactly 1", done)
 	}

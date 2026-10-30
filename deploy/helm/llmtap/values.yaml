@@ -1,0 +1,108 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/colinedwardwood/llmtap
+  tag: "" # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Breaker, max_in_flight, auth caches, and model-label cardinality are
+# per-replica process state. Scaling out is horizontal capacity, not a
+# shared circuit — see deploy/k8s/README.md.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+service:
+  type: ClusterIP
+  port: 4443
+  # Container port must match listen in the ConfigMap.
+  targetPort: 4443
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# GOMEMLIMIT should sit ~10% under the memory limit.
+env:
+  - name: GOMEMLIMIT
+    value: "1800MiB"
+  - name: LLMTAP_HEALTHCHECK_URL
+    value: "https://127.0.0.1:4443/healthz"
+  - name: LLMTAP_OTLP_ENDPOINT
+    value: "otel-collector.observability.svc:4317"
+  - name: LLMTAP_OTLP_INSECURE
+    value: "true"
+  - name: LLMTAP_OTLP_ACKNOWLEDGE_INSECURE
+    value: "true"
+
+# TLS material: mount a Secret (cert-manager Certificate example in
+# deploy/k8s/certificate.yaml) at /etc/llmtap/tls.
+tls:
+  enabled: true
+  secretName: llmtap-tls
+
+# Auth hashes: mount a Secret with key "tokens" (one PHC hash per line).
+auth:
+  enabled: false
+  secretName: llmtap-auth-tokens
+  mountPath: /etc/llmtap/auth
+
+config:
+  # Rendered into a ConfigMap. Secrets stay out of this blob.
+  listen: "0.0.0.0:4443"
+  serviceName: llmtap
+  environment: production
+  # Quote "off" — bare `off` is a YAML bool and becomes content.mode: false.
+  contentMode: "off"
+  contentRedact: "default"
+  maxBodyBytes: "33554432"
+  streamIdleTimeout: "5m"
+  maxInFlight: 256
+  breaker:
+    failures: 5
+    window: "30s"
+    recoveryWindow: "15s"
+  upstreams:
+    - name: openai
+      prefix: /v1
+      target: https://api.openai.com
+      provider: openai
+      stripPrefix: false
+    - name: anthropic
+      prefix: /anthropic
+      target: https://api.anthropic.com
+      provider: anthropic
+      stripPrefix: true
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 15
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+  # preStop sleep lets kube remove the endpoint before drain starts.
+  preStopSleepSeconds: 5
+  shutdownTimeoutSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

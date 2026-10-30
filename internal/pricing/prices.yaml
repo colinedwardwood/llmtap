@@ -1,13 +1,106 @@
 # Built-in pricing catalogue. Values are the public list price at time
-# of release (snapshot 2025-Q4). Operators should override via
-# `pricing.path` in config for negotiated rates.
+# of release (snapshot 2026-07 — keep in sync with pricing.Snapshot).
+# Operators should override via `pricing.path` in config for negotiated
+# rates.
 #
 # Schema: system → model-prefix → {input_usd_per_mtok, output_usd_per_mtok}
 # Lookup is longest-prefix-match against the request/response model
-# string, so snapshot pins (e.g. "gpt-4o-mini-2024-07-18") inherit
-# their family's rate.
+# string (lowercased), so snapshot pins (e.g. "gpt-4o-mini-2024-07-18")
+# inherit their family's rate. Order entries so more specific prefixes
+# exist wherever a family shares a shorter prefix with a differently
+# priced model (e.g. claude-opus-4 vs claude-opus-4-8).
 
 openai:
+  # --- current flagship / general ---
+  gpt-5.6-sol:
+    input_usd_per_mtok: 5.000
+    output_usd_per_mtok: 30.000
+  gpt-5.6-terra:
+    input_usd_per_mtok: 2.500
+    output_usd_per_mtok: 15.000
+  gpt-5.6-luna:
+    input_usd_per_mtok: 1.000
+    output_usd_per_mtok: 6.000
+  gpt-5.5-pro:
+    input_usd_per_mtok: 30.000
+    output_usd_per_mtok: 180.000
+  gpt-5.5-mini:
+    input_usd_per_mtok: 0.900
+    output_usd_per_mtok: 5.500
+  gpt-5.5-nano:
+    input_usd_per_mtok: 0.250
+    output_usd_per_mtok: 1.500
+  gpt-5.5:
+    input_usd_per_mtok: 5.000
+    output_usd_per_mtok: 30.000
+  gpt-5.4-pro:
+    input_usd_per_mtok: 30.000
+    output_usd_per_mtok: 180.000
+  gpt-5.4-mini:
+    input_usd_per_mtok: 0.750
+    output_usd_per_mtok: 4.500
+  gpt-5.4-nano:
+    input_usd_per_mtok: 0.200
+    output_usd_per_mtok: 1.250
+  gpt-5.4:
+    input_usd_per_mtok: 2.500
+    output_usd_per_mtok: 15.000
+  gpt-5.3-codex:
+    input_usd_per_mtok: 1.750
+    output_usd_per_mtok: 14.000
+  gpt-5.2:
+    input_usd_per_mtok: 1.750
+    output_usd_per_mtok: 14.000
+  gpt-5.1:
+    input_usd_per_mtok: 1.250
+    output_usd_per_mtok: 10.000
+  gpt-5-mini:
+    input_usd_per_mtok: 0.250
+    output_usd_per_mtok: 2.000
+    cached_input_usd_per_mtok: 0.025
+  gpt-5-nano:
+    input_usd_per_mtok: 0.050
+    output_usd_per_mtok: 0.400
+    cached_input_usd_per_mtok: 0.005
+  gpt-5:
+    input_usd_per_mtok: 1.250
+    output_usd_per_mtok: 10.000
+    cached_input_usd_per_mtok: 0.125
+  gpt-4.1-mini:
+    input_usd_per_mtok: 0.400
+    output_usd_per_mtok: 1.600
+  gpt-4.1-nano:
+    input_usd_per_mtok: 0.100
+    output_usd_per_mtok: 0.400
+  gpt-4.1:
+    input_usd_per_mtok: 2.000
+    output_usd_per_mtok: 8.000
+  # --- reasoning ---
+  o4-mini:
+    input_usd_per_mtok: 1.100
+    output_usd_per_mtok: 4.400
+  o3-pro:
+    input_usd_per_mtok: 20.000
+    output_usd_per_mtok: 80.000
+  o3-mini:
+    input_usd_per_mtok: 1.100
+    output_usd_per_mtok: 4.400
+  o3:
+    input_usd_per_mtok: 2.000
+    output_usd_per_mtok: 8.000
+  o1-pro:
+    input_usd_per_mtok: 150.000
+    output_usd_per_mtok: 600.000
+  o1-mini:
+    input_usd_per_mtok: 3.000
+    output_usd_per_mtok: 12.000
+  o1-preview:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 60.000
+  o1:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 60.000
+  # --- legacy chat ---
   gpt-4o-mini:
     input_usd_per_mtok: 0.150
     output_usd_per_mtok: 0.600
@@ -23,18 +116,6 @@ openai:
   gpt-3.5-turbo:
     input_usd_per_mtok: 0.500
     output_usd_per_mtok: 1.500
-  o1-mini:
-    input_usd_per_mtok: 3.000
-    output_usd_per_mtok: 12.000
-  o1-preview:
-    input_usd_per_mtok: 15.000
-    output_usd_per_mtok: 60.000
-  o1:
-    input_usd_per_mtok: 15.000
-    output_usd_per_mtok: 60.000
-  o3-mini:
-    input_usd_per_mtok: 1.100
-    output_usd_per_mtok: 4.400
   # Embedding models price per input only; output is conventionally 0.
   text-embedding-3-small:
     input_usd_per_mtok: 0.020
@@ -47,6 +128,51 @@ openai:
     output_usd_per_mtok: 0
 
 anthropic:
+  # --- current generation (claude-<family>-<major>-<minor> naming) ---
+  claude-fable-5:
+    input_usd_per_mtok: 10.000
+    output_usd_per_mtok: 50.000
+  claude-mythos-5:
+    input_usd_per_mtok: 10.000
+    output_usd_per_mtok: 50.000
+  claude-opus-4-8:
+    input_usd_per_mtok: 5.000
+    output_usd_per_mtok: 25.000
+  claude-opus-4-7:
+    input_usd_per_mtok: 5.000
+    output_usd_per_mtok: 25.000
+  claude-opus-4-6:
+    input_usd_per_mtok: 5.000
+    output_usd_per_mtok: 25.000
+  claude-opus-4-5:
+    input_usd_per_mtok: 5.000
+    output_usd_per_mtok: 25.000
+  # opus 4.1 and the retired opus 4 base kept their 15/75 rate — the
+  # longest-prefix rule means these MUST stay more specific than any
+  # "claude-opus-4" fallback (which is why no such fallback exists).
+  claude-opus-4-1:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 75.000
+  claude-opus-4-2025:
+    input_usd_per_mtok: 15.000
+    output_usd_per_mtok: 75.000
+  # Sonnet 5 intro price ($2/$10) runs through 2026-08-31, then moves
+  # to $3/$15 — bump on the next snapshot refresh.
+  claude-sonnet-5:
+    input_usd_per_mtok: 2.000
+    output_usd_per_mtok: 10.000
+  # sonnet 4, 4.5, 4.6 all sit at 3/15, so one family prefix covers
+  # every snapshot pin.
+  claude-sonnet-4:
+    input_usd_per_mtok: 3.000
+    output_usd_per_mtok: 15.000
+  claude-haiku-4-5:
+    input_usd_per_mtok: 1.000
+    output_usd_per_mtok: 5.000
+  # --- legacy (claude-<major>-<minor>-<family> naming) ---
+  claude-3-7-sonnet:
+    input_usd_per_mtok: 3.000
+    output_usd_per_mtok: 15.000
   claude-3-5-haiku:
     input_usd_per_mtok: 0.800
     output_usd_per_mtok: 4.000

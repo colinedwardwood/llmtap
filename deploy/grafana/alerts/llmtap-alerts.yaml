@@ -1,0 +1,78 @@
+# Starter PrometheusRule / Grafana-managed alert expressions for llmtap.
+# Import into Grafana Alerting, or adapt into a PrometheusRule CRD.
+#
+# Metric names are the Prometheus OTLP-receiver translations used by the
+# shipped dashboard (see internal/telemetry/dashboard_test.go).
+
+groups:
+  - name: llmtap.self-health
+    interval: 30s
+    rules:
+      - alert: LLMtapBreakerOpen
+        expr: max by (upstream) (llmtap_breaker_state) == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llmtap circuit breaker open for {{ $labels.upstream }}"
+          description: >
+            breaker.state=1 (open) for upstream {{ $labels.upstream }} for
+            more than 2m. Upstream 5xx storm or misclassified failures.
+            Check llmtap logs for trip events and upstream health.
+
+      - alert: LLMtapOTLPExportErrors
+        expr: sum(rate(llmtap_telemetry_export_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llmtap OTLP export errors"
+          description: >
+            Telemetry export is failing. /readyz may stay 503 after restart
+            until the first successful export. Check collector reachability
+            and LLMTAP_OTLP_* settings.
+
+      - alert: LLMtapHighRejectRate
+        expr: >
+          sum(rate(llmtap_requests_rejected_total[5m]))
+          /
+          clamp_min(sum(rate(llmtap_requests_total[5m])), 1e-9)
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llmtap rejecting >5% of requests"
+          description: >
+            Check reason label on llmtap_requests_rejected_total
+            (auth, breaker_open, concurrency, body_too_large, …).
+
+      - alert: LLMtapHigh5xxRate
+        expr: >
+          sum(rate(llmtap_requests_total{http_response_status_code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(llmtap_requests_total[5m])), 1e-9)
+          > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "llmtap 5xx ratio >5%"
+          description: >
+            Proxy-visible 5xx elevated. Correlate with breaker state and
+            upstream status panels on the llmtap-overview dashboard.
+
+      - alert: LLMtapCertExpiringSoon
+        expr: >
+          llmtap_tls_cert_not_after_seconds > 0
+          and
+          (llmtap_tls_cert_not_after_seconds - time()) < 7 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "llmtap TLS certificate expires within 7 days"
+          description: >
+            Hot-reload will pick up a renewed file automatically when
+            cert-manager rotates the mounted Secret. If reload failures
+            climb, check llmtap_tls_cert_reload_failures_total.

@@ -31,6 +31,7 @@ func fakeProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecorder) 
 	tokens, _ := meter.Int64Histogram("gen_ai.client.token.usage")
 	dur, _ := meter.Float64Histogram("gen_ai.client.operation.duration")
 	ttft, _ := meter.Float64Histogram("gen_ai.client.time_to_first_token")
+	ttfb, _ := meter.Float64Histogram("gen_ai.server.time_to_first_byte")
 	cost, _ := meter.Float64Histogram("gen_ai.client.cost.usd")
 	costTotal, _ := meter.Float64Counter("gen_ai.client.cost.usd.total")
 
@@ -41,6 +42,7 @@ func fakeProviders(t *testing.T) (telemetry.Providers, *tracetest.SpanRecorder) 
 			TokenUsage:        tokens,
 			OperationDuration: dur,
 			TimeToFirstToken:  ttft,
+			TimeToFirstByte:   ttfb,
 			CostUSD:           cost,
 			CostUSDTotal:      costTotal,
 		},

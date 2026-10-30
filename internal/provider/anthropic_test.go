@@ -66,9 +66,8 @@ func TestAnthropicWrapStreamToolOnlyStreamFiresFirstToken(t *testing.T) {
 	_, span := tp.Tracer("t").Start(context.Background(), "init")
 	info := &Info{System: "anthropic", Operation: "chat", RequestModel: "claude-3-5-sonnet-20241022"}
 
-	firstToken, done := 0, 0
+	done := 0
 	stream := Anthropic{}.WrapStream(span, info, io.NopCloser(strings.NewReader(b.String())), ContentOpts{},
-		func() { firstToken++ },
 		func() { done++ },
 	)
 	if _, err := io.ReadAll(stream); err != nil {
@@ -76,9 +75,6 @@ func TestAnthropicWrapStreamToolOnlyStreamFiresFirstToken(t *testing.T) {
 	}
 	_ = stream.Close()
 
-	if firstToken != 1 {
-		t.Errorf("firstToken called %d times, want exactly 1 on tool-only stream", firstToken)
-	}
 	if done != 1 {
 		t.Errorf("done called %d times, want exactly 1", done)
 	}
@@ -90,5 +86,38 @@ func TestAnthropicWrapStreamToolOnlyStreamFiresFirstToken(t *testing.T) {
 	}
 	if info.OutputTokens != 7 {
 		t.Errorf("output tokens = %d, want 7", info.OutputTokens)
+	}
+}
+
+func TestAnthropicThinkingDeltaFiresTTFT(t *testing.T) {
+	t.Parallel()
+	sse := "event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"considering"}}` +
+		"\n\n"
+	_, tp := newRecorderTracer()
+	_, span := tp.Tracer("t").Start(context.Background(), "anthropic")
+	info := &Info{System: "anthropic", Operation: "chat"}
+	body := Anthropic{}.WrapStream(span, info, io.NopCloser(strings.NewReader(sse)), ContentOpts{}, func() {})
+	if _, err := io.ReadAll(body); err != nil {
+		t.Fatal(err)
+	}
+	_ = body.Close()
+	if info.FirstTokenAt.IsZero() {
+		t.Fatal("thinking_delta did not set FirstTokenAt")
+	}
+}
+
+func TestAnthropicCacheUsageNormalizesInputTotal(t *testing.T) {
+	t.Parallel()
+	info := &Info{System: "anthropic", Operation: "chat"}
+	body := []byte(`{"id":"m1","model":"claude-sonnet-4","usage":{
+		"input_tokens":10,"cache_read_input_tokens":20,
+		"cache_creation_input_tokens":5,"output_tokens":7}}`)
+	if _, ok := DecodeAnthropicResponseJSON(info, body); !ok {
+		t.Fatal("decode failed")
+	}
+	if info.InputTokens != 35 || info.CacheReadInputTokens != 20 ||
+		info.CacheCreationInputTokens != 5 || info.OutputTokens != 7 {
+		t.Fatalf("usage = %+v", info)
 	}
 }

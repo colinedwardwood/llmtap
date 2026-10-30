@@ -23,13 +23,25 @@ tls:
   key_file:  ""        # e.g. /etc/llmtap/tls.key
   client_ca_file: ""   # optional, enables required mTLS
 
-# Upstream LLM APIs. The first matching prefix (longest wins) routes the
-# request. Provider must be one of: openai | anthropic.
+# Upstream LLM APIs. The longest matching prefix (at a path-segment
+# boundary) routes the request. Provider: openai | anthropic | gemini.
+#
+# strip_prefix decides what the upstream sees:
+#   false (default) - the prefix IS the upstream's real base path and
+#                     forwards as-is. Right for /v1 -> api.openai.com,
+#                     where clients send /v1/chat/completions and the
+#                     upstream expects exactly that.
+#   true            - the prefix is a routing-only mount and is removed
+#                     before forwarding. Right for /anthropic ->
+#                     api.anthropic.com, where the SDK sends
+#                     /anthropic/v1/messages but the upstream expects
+#                     /v1/messages. Without it, every request 404s.
 upstreams:
   - name: openai
     prefix: /v1
     target: https://api.openai.com
     provider: openai
+    # strip_prefix: false         # /v1 is OpenAI's real base path
     # max_in_flight: 256          # cap concurrent forwarded requests;
                                   # over-cap = 429 + Retry-After: 1.
                                   # Pairs with the circuit breaker
@@ -56,11 +68,19 @@ upstreams:
     prefix: /anthropic
     target: https://api.anthropic.com
     provider: anthropic
+    strip_prefix: true            # /anthropic is routing-only; the
+                                  # upstream expects /v1/messages
     # max_in_flight: 256
     # pin_sha256: []
     # breaker:
     #   failures: 5
     #   recovery_window: 15s
+
+  # - name: gemini
+  #   prefix: /gemini
+  #   target: https://generativelanguage.googleapis.com
+  #   provider: gemini
+  #   strip_prefix: true
 
 # OpenTelemetry export. Endpoint format depends on protocol:
 #   grpc: "host:4317"        (no scheme)
@@ -75,6 +95,11 @@ telemetry:
                                  # rarely intentional, so the proxy
                                  # refuses by default.
   sample_ratio: 1.0
+  # Error/5xx spans are always retained. These optional export-time
+  # priority thresholds retain expensive or slow spans even when the
+  # baseline sample_ratio decision drops them.
+  cost_sample_threshold_usd: 0
+  slow_sample_threshold: 0s
   timeout: 10s
   # headers:
   #   X-Scope-OrgID: tenant-1
@@ -87,14 +112,16 @@ telemetry:
 #     off    - only metadata (model, tokens, finish reasons) leaves
 #              the proxy. Default.
 #     events - attach content as span events.
-#     logs   - send content via the OTel log signal (retention can be
-#              scoped separately at the collector).
+#     logs   - emit content through the OTel log signal.
 #
 #   redact: off|default|strict
 #     off     - passthrough, no scrubbing. Must be explicit opt-in.
 #     default - mask high-confidence credential / PII markers:
-#               OpenAI sk-, Slack xox*, AWS AKIA, GCP service-account
-#               private_key, common JWT shape, emails. RECOMMENDED.
+#               OpenAI sk-, Slack xox*, AWS AKIA, Google AIza, Groq
+#               gsk_, Replicate r8_, Hugging Face hf_, xAI xai-,
+#               GitHub ghp_/github_pat_, GCP service-account
+#               private_key, raw PEM private-key blocks, common JWT
+#               shape, emails. RECOMMENDED.
 #     strict  - default + credit-card (Luhn-validated) + US SSN +
 #               E.164 phone numbers. For regulated workloads.
 #
@@ -119,6 +146,12 @@ http:
   # advances. This is what makes cert-manager / Let's Encrypt renewals
   # work without restarting the process. Zero disables hot-reload.
   cert_reload_interval: 30s
+  # stream_idle_timeout is the max silence between upstream body bytes
+  # AFTER response headers. A hung SSE/JSON stream that never EOFs
+  # would otherwise pin a concurrency slot and block WaitForStreams
+  # forever. Trips emit span event llmtap.stream.idle_timeout and
+  # metric llmtap.streams.idle_timeouts.total. Zero disables.
+  stream_idle_timeout: 5m
 
 # Inbound request shaping. llmtap buffers up to 1 MiB of every request
 # body for parser-driven enrichment, then forwards the original stream
@@ -141,7 +174,22 @@ request:
 auth:
   # tokens:
   #   - "$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>"
+  # tokens_file: /etc/llmtap/auth/tokens   # one PHC hash per line;
+  #                                        # preferred for k8s Secret mounts
+  #                                        # (also LLMTAP_AUTH_TOKENS_FILE)
   header: "X-LLMTAP-Token"   # default; keeps Authorization free for the upstream
+
+# Per-caller attribution priority: configured header, mTLS certificate
+# common name, then a non-reversible auth-token fingerprint. The raw caller
+# is a span attribute; metric labels are capped and overflow to `_other`.
+attribution:
+  header: ""                  # e.g. X-Caller
+  max_cardinality: 200
+
+# Optional append-only record/replay JSONL. Disabled by default. Request,
+# response, and URL values always inherit content.redact. Files are 0600.
+recording:
+  path: ""                    # e.g. /var/lib/llmtap/traffic.jsonl
 
 # Cost catalogue override. Built-in prices ship with llmtap (see
 # internal/pricing/prices.yaml for the embedded snapshot). Production

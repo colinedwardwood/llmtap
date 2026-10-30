@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"strings"
@@ -11,9 +12,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
-
-// path matching helpers (pathSegments, isAPIParent, isVersionSegment) live
-// in openai.go — same package, shared semantics across providers.
 
 // Anthropic parses the Messages API ("/v1/messages"). Anthropic streams as
 // named SSE events (message_start, content_block_delta, message_delta,
@@ -54,66 +52,63 @@ type anthropicMessage struct {
 	Content json.RawMessage `json:"content"`
 }
 
-func (Anthropic) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
-	op := (Anthropic{}).OperationFor(urlPath)
+// decodedAnthropicRequest is the pure-decode result for the Messages API.
+type decodedAnthropicRequest struct {
+	Info     Info
+	System   json.RawMessage
+	Messages []anthropicMessage
+	OK       bool
+}
+
+// DecodeRequest parses a Messages body without touching a span.
+func (a Anthropic) DecodeRequest(urlPath string, body []byte) decodedAnthropicRequest {
 	info := Info{
 		System:    genai.SystemAnthropic,
-		Operation: op,
+		Operation: a.OperationFor(urlPath),
 		Started:   time.Now(),
 	}
 	var req anthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		span.SetAttributes(attribute.String(genai.AttrSystem, info.System))
-		return info
+		return decodedAnthropicRequest{Info: info, OK: false}
 	}
-
 	info.RequestModel = req.Model
 	info.Stream = req.Stream
+	info.Params = RequestParams{
+		Temperature:   req.Temperature,
+		TopP:          req.TopP,
+		TopK:          req.TopK,
+		MaxTokens:     req.MaxTokens,
+		StopSequences: req.StopSeq,
+	}
+	return decodedAnthropicRequest{
+		Info:     info,
+		System:   req.System,
+		Messages: req.Messages,
+		OK:       true,
+	}
+}
 
-	attrs := []attribute.KeyValue{
-		attribute.String(genai.AttrSystem, info.System),
-		attribute.String(genai.AttrOperationName, op),
-		attribute.Bool(genai.AttrStream, req.Stream),
+func (a Anthropic) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
+	dec := a.DecodeRequest(urlPath, body)
+	if !dec.OK {
+		span.SetAttributes(attribute.String(genai.AttrSystem, dec.Info.System))
+		return dec.Info
 	}
-	if req.Model != "" {
-		attrs = append(attrs, attribute.String(genai.AttrRequestModel, req.Model))
-	}
-	if req.MaxTokens != nil {
-		attrs = append(attrs, attribute.Int64(genai.AttrRequestMaxTokens, *req.MaxTokens))
-	}
-	if req.Temperature != nil {
-		attrs = append(attrs, attribute.Float64(genai.AttrRequestTemperature, *req.Temperature))
-	}
-	if req.TopP != nil {
-		attrs = append(attrs, attribute.Float64(genai.AttrRequestTopP, *req.TopP))
-	}
-	if req.TopK != nil {
-		attrs = append(attrs, attribute.Int64(genai.AttrRequestTopK, *req.TopK))
-	}
-	if len(req.StopSeq) > 0 {
-		attrs = append(attrs, attribute.StringSlice(genai.AttrRequestStopSequences, req.StopSeq))
-	}
-	span.SetAttributes(attrs...)
-	span.SetName(genai.SpanName(op, info.RequestModel))
-
-	if content.Capture {
-		if len(req.System) > 0 {
-			span.AddEvent(genai.EventSystemMessage, trace.WithAttributes(
-				attribute.String("content", content.Clean(string(req.System))),
-			))
+	emitRequestAttrs(span, &dec.Info)
+	if content.Capture() {
+		ctx := trace.ContextWithSpan(context.Background(), span)
+		if len(dec.System) > 0 {
+			content.emitRoleMessage(ctx, span, genai.EventSystemMessage, "system", string(dec.System))
 		}
-		for _, m := range req.Messages {
+		for _, m := range dec.Messages {
 			eventName := genai.EventUserMessage
 			if m.Role == "assistant" {
 				eventName = genai.EventAssistantMessage
 			}
-			span.AddEvent(eventName, trace.WithAttributes(
-				attribute.String("role", m.Role),
-				attribute.String("content", content.Clean(string(m.Content))),
-			))
+			content.emitRoleMessage(ctx, span, eventName, m.Role, string(m.Content))
 		}
 	}
-	return info
+	return dec.Info
 }
 
 type anthropicResponse struct {
@@ -122,11 +117,18 @@ type anthropicResponse struct {
 	StopReason string             `json:"stop_reason"`
 	Usage      anthropicUsage     `json:"usage"`
 	Content    []anthropicContent `json:"content"`
+	Error      *anthropicError    `json:"error"`
 }
 
 type anthropicUsage struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+type anthropicError struct {
+	Type string `json:"type"`
 }
 
 type anthropicContent struct {
@@ -134,10 +136,12 @@ type anthropicContent struct {
 	Text string `json:"text"`
 }
 
-func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts) {
+// DecodeAnthropicResponseJSON merges response fields into info. Returns
+// assembled text for optional content emit.
+func DecodeAnthropicResponseJSON(info *Info, body []byte) (text string, ok bool) {
 	var resp anthropicResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return
+		return "", false
 	}
 	if resp.Model != "" {
 		info.ResponseModel = resp.Model
@@ -148,23 +152,39 @@ func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, con
 	if resp.StopReason != "" {
 		info.FinishReasons = append(info.FinishReasons, resp.StopReason)
 	}
-	info.InputTokens = resp.Usage.InputTokens
-	info.OutputTokens = resp.Usage.OutputTokens
-
-	span.SetAttributes(responseAttrs(info)...)
-
-	if content.Capture {
-		var b strings.Builder
-		for _, c := range resp.Content {
-			if c.Type == "text" {
-				b.WriteString(c.Text)
-			}
+	mergeAnthropicUsage(info, resp.Usage)
+	if resp.Error != nil {
+		info.ErrorType = resp.Error.Type
+	}
+	var b strings.Builder
+	for _, c := range resp.Content {
+		if c.Type == "text" {
+			b.WriteString(c.Text)
 		}
-		if b.Len() > 0 {
-			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.String("message", content.Clean(b.String())),
-			))
-		}
+	}
+	return b.String(), true
+}
+
+func mergeAnthropicUsage(info *Info, usage anthropicUsage) {
+	if usage.InputTokens > 0 || usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0 {
+		info.InputTokens = usage.InputTokens + usage.CacheReadInputTokens + usage.CacheCreationInputTokens
+		info.CacheReadInputTokens = usage.CacheReadInputTokens
+		info.CacheCreationInputTokens = usage.CacheCreationInputTokens
+	}
+	if usage.OutputTokens > 0 {
+		info.OutputTokens = usage.OutputTokens
+	}
+}
+
+func (Anthropic) ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts) {
+	text, ok := DecodeAnthropicResponseJSON(info, body)
+	if !ok {
+		return
+	}
+	emitResponseAttrs(span, info)
+	if content.Capture() && text != "" {
+		ctx := trace.ContextWithSpan(context.Background(), span)
+		content.emitChoice(ctx, span, 0, "", text)
 	}
 }
 
@@ -181,8 +201,9 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicDelta struct {
-	Type string `json:"type,omitempty"`
-	Text string `json:"text,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
 	// PartialJSON carries one chunk of a streaming tool_use block's
 	// `input` JSON. Anthropic emits these via content_block_delta with
 	// type=input_json_delta when the model is calling a tool. We don't
@@ -197,15 +218,10 @@ func (Anthropic) WrapStream(
 	info *Info,
 	body io.ReadCloser,
 	content ContentOpts,
-	onFirstToken func(),
 	onDone func(),
 ) io.ReadCloser {
-	var (
-		assembled strings.Builder
-		gotFirst  bool
-	)
-
-	onEvent := func(_ string, data []byte) {
+	c := newStreamCollector(span, info, content, onDone)
+	return c.wrap(body, func(_ string, data []byte) {
 		if len(data) == 0 {
 			return
 		}
@@ -222,9 +238,7 @@ func (Anthropic) WrapStream(
 				if ev.Message.ID != "" {
 					info.ResponseID = ev.Message.ID
 				}
-				if ev.Message.Usage.InputTokens > 0 {
-					info.InputTokens = ev.Message.Usage.InputTokens
-				}
+				mergeAnthropicUsage(info, ev.Message.Usage)
 			}
 		case "content_block_delta":
 			// Anthropic content_block_delta carries either a text_delta
@@ -237,57 +251,30 @@ func (Anthropic) WrapStream(
 				switch ev.Delta.Type {
 				case "text_delta":
 					if ev.Delta.Text != "" {
-						if !gotFirst {
-							gotFirst = true
-							info.FirstTokenAt = time.Now()
-							onFirstToken()
-						}
-						if content.Capture {
-							assembled.WriteString(ev.Delta.Text)
-						}
+						c.noteFirstToken()
+						c.appendText(ev.Delta.Text)
 					}
 				case "input_json_delta":
-					if !gotFirst {
-						gotFirst = true
-						info.FirstTokenAt = time.Now()
-						onFirstToken()
-					}
+					c.noteFirstToken()
 					// Tool-argument JSON fragments are intentionally not
 					// assembled — they belong to a tool_use block, not
 					// to assistant text, and concatenating them onto the
 					// transcript would produce garbage.
+				case "thinking_delta":
+					if ev.Delta.Thinking != "" {
+						c.noteFirstToken()
+					}
 				}
 			}
 		case "message_delta":
 			if ev.Delta != nil && ev.Delta.StopReason != "" {
 				info.FinishReasons = append(info.FinishReasons, ev.Delta.StopReason)
 			}
-			if ev.Usage != nil && ev.Usage.OutputTokens > 0 {
-				info.OutputTokens = ev.Usage.OutputTokens
+			if ev.Usage != nil {
+				mergeAnthropicUsage(info, *ev.Usage)
 			}
 		}
-	}
-
-	var tee *sseTee
-	closer := func() {
-		if !info.Finished.IsZero() {
-			return
-		}
-		info.Finished = time.Now()
-		span.SetAttributes(responseAttrs(info)...)
-		if content.Capture && assembled.Len() > 0 {
-			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.String("message", content.Clean(assembled.String())),
-			))
-		}
-		if n := tee.Overflows(); n > 0 {
-			span.SetAttributes(attribute.Int("llmtap.sse_parser_overflows", n))
-		}
-		onDone()
-	}
-
-	tee = newSSETee(body, onEvent, nil, closer)
-	return tee
+	})
 }
 
 var _ Provider = (*Anthropic)(nil)

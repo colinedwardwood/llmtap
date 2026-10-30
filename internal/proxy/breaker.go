@@ -52,6 +52,13 @@ type breaker struct {
 
 	// now is injected for tests; production uses time.Now.
 	now func() time.Time
+
+	// Optional observability hooks (set by Handler.New). Invoked
+	// without holding b.mu so metrics / logs cannot deadlock the
+	// breaker. Nil hooks are no-ops.
+	onTrip     func()
+	onRecover  func()
+	onHalfOpen func()
 }
 
 // newBreaker constructs a breaker from validated config. The caller is
@@ -75,7 +82,13 @@ func newBreaker(cfg config.BreakerConfig) *breaker {
 // false.
 func (b *breaker) admit() (ok bool, retryAfter int) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var after func()
+	defer func() {
+		b.mu.Unlock()
+		if after != nil {
+			after()
+		}
+	}()
 
 	switch b.state {
 	case breakerClosed:
@@ -87,6 +100,7 @@ func (b *breaker) admit() (ok bool, retryAfter int) {
 		if b.now().Sub(b.openedAt) >= b.cfg.RecoveryWindow {
 			b.state = breakerHalfOpen
 			b.probeInFlight = true
+			after = b.onHalfOpen
 			return true, 0
 		}
 		// Still open; tell the client when to retry.
@@ -124,7 +138,13 @@ func (b *breaker) report(statusCode int) {
 	failure := statusCode >= 500 && statusCode <= 599
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var after func()
+	defer func() {
+		b.mu.Unlock()
+		if after != nil {
+			after()
+		}
+	}()
 
 	switch b.state {
 	case breakerHalfOpen:
@@ -132,13 +152,14 @@ func (b *breaker) report(statusCode int) {
 		// the state machine cares about while half-open.
 		b.probeInFlight = false
 		if failure {
-			b.trip()
+			after = b.tripLocked()
 			return
 		}
 		// Probe succeeded — reset to closed and zero counters.
 		b.state = breakerClosed
 		b.consecutive = 0
 		b.lastFailure = time.Time{}
+		after = b.onRecover
 		return
 
 	case breakerClosed:
@@ -153,7 +174,7 @@ func (b *breaker) report(statusCode int) {
 			b.consecutive++
 			b.lastFailure = now
 			if b.consecutive >= b.cfg.Failures {
-				b.trip()
+				after = b.tripLocked()
 			}
 			return
 		}
@@ -174,10 +195,12 @@ func (b *breaker) report(statusCode int) {
 	}
 }
 
-// trip moves the breaker into open. Caller must hold b.mu.
-func (b *breaker) trip() {
+// tripLocked moves the breaker into open and returns the onTrip hook
+// to run after the mutex is released. Caller must hold b.mu.
+func (b *breaker) tripLocked() func() {
 	b.state = breakerOpen
 	b.openedAt = b.now()
 	b.probeInFlight = false
 	b.consecutive = 0
+	return b.onTrip
 }

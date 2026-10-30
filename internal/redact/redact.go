@@ -134,6 +134,19 @@ var (
 		// Replicate API tokens: `r8_` prefix + 20+ chars. Lower
 		// bound is conservative; real tokens are longer.
 		regexp.MustCompile(`\br8_[A-Za-z0-9]{20,}\b`),
+		// Hugging Face user access tokens: `hf_` prefix. HF traffic
+		// shows up constantly in LLM prompts (model cards, curl
+		// examples pasted into chats).
+		regexp.MustCompile(`\bhf_[A-Za-z0-9]{20,}\b`),
+		// xAI API keys: `xai-` prefix + long body.
+		regexp.MustCompile(`\bxai-[A-Za-z0-9_-]{20,}\b`),
+		// Raw PEM private-key blocks (RSA / EC / OPENSSH / PKCS#8 /
+		// encrypted). Multi-line by construction, so (?s) lets `.`
+		// cross newlines; the lazy body stops at the first END marker.
+		// Public material (CERTIFICATE, PUBLIC KEY) is deliberately
+		// not matched — it isn't secret and masking it would mangle
+		// legitimate cert-debugging prompts.
+		regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`),
 		// GitHub classic / app tokens. The `gh_` family share a
 		// 36-char floor; loose upper bound covers forward growth.
 		regexp.MustCompile(`\bghp_[A-Za-z0-9]{36,255}\b`),

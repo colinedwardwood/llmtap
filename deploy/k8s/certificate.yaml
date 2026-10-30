@@ -1,0 +1,33 @@
+# Example cert-manager Certificate for the Helm chart's tls.secretName.
+# Adjust dnsNames / issuer to your cluster.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: llmtap-tls
+  namespace: default
+spec:
+  secretName: llmtap-tls
+  duration: 2160h # 90d
+  renewBefore: 360h # 15d
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - llmtap.default.svc
+    - llmtap.default.svc.cluster.local
+  issuerRef:
+    name: cluster-issuer
+    kind: ClusterIssuer
+---
+# Optional: Secret shape for auth.tokens_file (create via sealed-secrets /
+# external-secrets — do not commit real hashes).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llmtap-auth-tokens
+  namespace: default
+type: Opaque
+stringData:
+  tokens: |
+    # one argon2id PHC hash per line (llmtap hash-token)
+    # $argon2id$v=19$m=65536,t=3,p=2$…

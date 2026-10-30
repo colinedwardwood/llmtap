@@ -1,0 +1,25 @@
+# Keep the build context to what `go build` needs. Anything else
+# busts layer cache on unrelated edits and risks leaking local files
+# (gitignored config.yaml / .env) into build cache records. (D4)
+.git
+.github
+.worktrees
+.claude
+deploy
+docs
+test
+*.md
+LICENSE
+Makefile
+.golangci.yml
+.gitignore
+.dockerignore
+config.yaml
+config.*.yaml
+!config.example.yaml
+.env
+*.key
+*.crt
+llmtap
+llmtap-*
+coverage.*

@@ -43,7 +43,16 @@ const (
 const (
 	cacheMaxEntries = 1024
 	cacheTTL        = 60 * time.Second
-	tokenMaxLen     = 512
+	// negativeCacheTTL bounds how long a failed plaintext is remembered
+	// without re-running argon2. Short enough that a rotated token
+	// becomes valid quickly; long enough to shed brute-force replays.
+	negativeCacheTTL = 30 * time.Second
+	negativeCacheMax = 4096
+	tokenMaxLen      = 512
+	// MaxAllowListTokens is the hard ceiling on auth.tokens entries.
+	// Each miss runs argon2 against every hash in the list; keep the
+	// allow-list short and rotate via tokens_file mounts.
+	MaxAllowListTokens = 64
 )
 
 // Hash produces an argon2id PHC-encoded hash of plain. The encoded
@@ -175,6 +184,10 @@ type Verifier struct {
 	// cacheOrder is the LRU access order: newest at the back.
 	cacheOrder [][32]byte
 
+	// negativeCache remembers recent auth failures so replays of the
+	// same wrong token skip argon2 for negativeCacheTTL.
+	negativeCache map[[32]byte]time.Time
+
 	// now is injected for tests; production uses time.Now.
 	now func() time.Time
 
@@ -189,11 +202,15 @@ type Verifier struct {
 // any entry is malformed — fail-fast at startup is the right behaviour
 // for an auth boundary.
 func NewVerifier(encoded []string) (*Verifier, error) {
+	if len(encoded) > MaxAllowListTokens {
+		return nil, fmt.Errorf("auth.tokens: %d entries exceeds maximum %d", len(encoded), MaxAllowListTokens)
+	}
 	v := &Verifier{
-		allow: make([]parsed, 0, len(encoded)),
-		sem:   make(chan struct{}, runtime.NumCPU()),
-		cache: make(map[[32]byte]time.Time, cacheMaxEntries),
-		now:   time.Now,
+		allow:         make([]parsed, 0, len(encoded)),
+		sem:           make(chan struct{}, runtime.NumCPU()),
+		cache:         make(map[[32]byte]time.Time, cacheMaxEntries),
+		negativeCache: make(map[[32]byte]time.Time, negativeCacheMax),
+		now:           time.Now,
 	}
 	for i, e := range encoded {
 		p, err := parseEncoded(e)
@@ -245,6 +262,10 @@ func (v *Verifier) Verify(plain string) (ok bool, busy bool) {
 	if v.cacheLookup(plainHash) {
 		return true, false
 	}
+	// Negative cache: recent miss on this exact plaintext skips argon2.
+	if v.negativeCacheLookup(plainHash) {
+		return false, false
+	}
 
 	// Acquire the argon2 semaphore. Non-blocking try-acquire: when
 	// the cap is reached, surface busy=true so the caller can answer
@@ -273,8 +294,10 @@ func (v *Verifier) Verify(plain string) (ok bool, busy bool) {
 	}
 	if matched == 1 {
 		v.cacheStore(plainHash)
+		v.negativeCacheForget(plainHash)
 		return true, false
 	}
+	v.negativeCacheStore(plainHash)
 	return false, false
 }
 
@@ -353,4 +376,37 @@ func (v *Verifier) cacheStore(plainHash [32]byte) {
 	}
 	v.cache[plainHash] = v.now().Add(cacheTTL)
 	v.cacheOrder = append(v.cacheOrder, plainHash)
+}
+
+func (v *Verifier) negativeCacheLookup(plainHash [32]byte) bool {
+	v.cacheMu.Lock()
+	defer v.cacheMu.Unlock()
+	expiresAt, ok := v.negativeCache[plainHash]
+	if !ok {
+		return false
+	}
+	if v.now().After(expiresAt) {
+		delete(v.negativeCache, plainHash)
+		return false
+	}
+	return true
+}
+
+func (v *Verifier) negativeCacheStore(plainHash [32]byte) {
+	v.cacheMu.Lock()
+	defer v.cacheMu.Unlock()
+	if len(v.negativeCache) >= negativeCacheMax {
+		// Drop one arbitrary entry — negative cache is best-effort.
+		for k := range v.negativeCache {
+			delete(v.negativeCache, k)
+			break
+		}
+	}
+	v.negativeCache[plainHash] = v.now().Add(negativeCacheTTL)
+}
+
+func (v *Verifier) negativeCacheForget(plainHash [32]byte) {
+	v.cacheMu.Lock()
+	defer v.cacheMu.Unlock()
+	delete(v.negativeCache, plainHash)
 }

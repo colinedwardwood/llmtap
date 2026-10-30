@@ -92,6 +92,26 @@ func TestApplyDefaultMasksHighConfidenceSecrets(t *testing.T) {
 			masks: []string{"github_pat_11ABCDE000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 			keeps: []string{"token:"},
 		},
+		{
+			name:  "Hugging Face token",
+			in:    "HF_TOKEN=hf_AbCdEfGhIjKlMnOpQrStUvWxYz012345",
+			masks: []string{"hf_AbCdEfGhIjKlMnOpQrStUvWxYz012345"},
+			keeps: []string{"HF_TOKEN"},
+		},
+		{
+			name:  "xAI API key",
+			in:    "XAI_API_KEY=xai-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+			masks: []string{"xai-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"},
+			keeps: []string{"XAI_API_KEY"},
+		},
+		{
+			name: "raw PEM private key block",
+			in: "here is my key\n-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+				"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw\n" +
+				"-----END OPENSSH PRIVATE KEY-----\nthanks",
+			masks: []string{"BEGIN OPENSSH PRIVATE KEY", "b3BlbnNzaC1rZXktdjEA"},
+			keeps: []string{"here is my key", "thanks"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,6 +137,10 @@ func TestApplyDefaultDoesNotMaskProse(t *testing.T) {
 	t.Parallel()
 	// Strings that LOOK suspicious but shouldn't trip the patterns.
 	prose := []string{
+		// Public PEM material is not secret; masking it would break
+		// legitimate cert-debugging prompts.
+		"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+		"-----BEGIN PUBLIC KEY-----\nMFkw\n-----END PUBLIC KEY-----",
 		"sk-and-flowers please",                   // too short after sk-
 		"Build hash 5fe8b9c0a01dfa3 looks OK",     // not credit-card length
 		"port 12345-67890 is open",                // not an SSN

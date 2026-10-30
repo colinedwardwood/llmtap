@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,11 +37,12 @@ import (
 	"github.com/colinedwardwood/llmtap/internal/pricing"
 	"github.com/colinedwardwood/llmtap/internal/provider"
 	"github.com/colinedwardwood/llmtap/internal/redact"
+	"github.com/colinedwardwood/llmtap/internal/replay"
 	"github.com/colinedwardwood/llmtap/internal/telemetry"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
+	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -53,12 +55,19 @@ import (
 // to give up on enrichment; it is not allowed to give up on the bytes.
 const maxEnrichmentBodyBytes = 1024 * 1024 // 1 MiB
 
+// statusClientClosedRequest is nginx's non-standard 499 "client closed
+// request". Emitted when the client disconnects before the upstream
+// answers, so metrics and the breaker can distinguish "caller went
+// away" from an upstream-side 5xx fault.
+const statusClientClosedRequest = 499
+
 // ctxKey scopes per-request data carried into ModifyResponse. We never share
 // a *httputil.ReverseProxy field across goroutines for per-request state.
 type ctxKey int
 
 const (
 	ctxKeyModify ctxKey = iota
+	ctxKeyCaller
 )
 
 type modifyFn func(*http.Response) error
@@ -72,23 +81,55 @@ type Handler struct {
 	tracer    trace.Tracer
 	meters    telemetry.GenAIMeters
 	inflight  metric.Int64UpDownCounter
-	requests  metric.Int64Counter
-	logger    *slog.Logger
+	// requests counts EVERY outcome past the health probes — enriched,
+	// passthrough, and reject — labelled by upstream + status. Used to
+	// lie (status 0 / passthrough missing / rejects missing); fixed in D22.
+	requests metric.Int64Counter
+	// rejected counts operator / proxy rejects that never reached a
+	// healthy upstream attempt (auth, breaker, concurrency, 413, 404).
+	rejected metric.Int64Counter
+	// authRejected counts bearer-token failures (401). Distinct from
+	// auth_busy (429), which is overcrowding of the argon2 semaphore.
+	authRejected metric.Int64Counter
+	// breakerState is 0=closed / 1=open / 2=half_open per upstream.
+	breakerState metric.Int64Gauge
+	// streamsActive is the OTel twin of activeStreams; WaitForStreams
+	// still reads the atomic, dashboards read the gauge counter.
+	streamsActive metric.Int64UpDownCounter
+	// streamIdleTimeouts counts post-header upstream body stalls that
+	// exceeded http.stream_idle_timeout and were force-closed.
+	streamIdleTimeouts metric.Int64Counter
+	// certNotAfter is unix seconds of the currently-served leaf
+	// certificate's NotAfter. Zero when TLS is off. Operators alert
+	// when (certNotAfter - now) drops below a week.
+	certNotAfter metric.Int64Gauge
+	// certReloadFailures counts failed hot-reload attempts (torn
+	// reads, parse errors). The previous cert stays active.
+	certReloadFailures metric.Int64Counter
+	// pricingMisses counts token-bearing responses the cost pipeline
+	// could not price. Silent misses were the failure mode: the
+	// pricing table ages, new models appear, and the spend dashboard
+	// quietly undercounts exactly when spend grows.
+	pricingMisses metric.Int64Counter
+	logger        *slog.Logger
+	contentLogger otellog.Logger
 
 	// activeStreams is incremented on stream wrap and decremented on close.
-	// Exposed via expvar-style debug if ever needed; the field exists so
-	// shutdown can wait for streams to drain instead of guessing.
+	// Shutdown drains against this atomic; streamsActive mirrors it for
+	// OTel export.
 	activeStreams atomic.Int64
 
 	// modelLabel bounds the cardinality of gen_ai.{request,response}.model
 	// values on the metric path. Span attributes keep the raw model
 	// string — span cardinality is governed by retention.
-	modelLabel *labels.ModelLabel
+	modelLabel  *labels.ModelLabel
+	callerLabel *labels.ModelLabel
 
 	// pricing is the active cost catalogue (built-in defaults, optionally
 	// overlaid with an operator file). Held per-Handler so
 	// `cfg.Pricing.Path` actually changes the recorded cost.
-	pricing *pricing.Table
+	pricing  *pricing.Table
+	recorder *replay.Recorder
 
 	// auth gates inbound requests against an operator-configured
 	// allow-list of bearer-token hashes. Nil = no auth required.
@@ -104,8 +145,8 @@ type Handler struct {
 
 	// breakers holds the per-upstream circuit breaker. A missing entry
 	// means the breaker is disabled for that upstream. State updates
-	// happen from the responseInterceptor once the upstream status code
-	// is known; admission checks happen in ServeHTTP.
+	// happen from ServeHTTP's admission release once the upstream
+	// status code is known; admission checks happen in ServeHTTP.
 	breakers map[string]*breaker
 
 	// ready is the readiness probe used by /readyz. Set by callers via
@@ -113,6 +154,8 @@ type Handler struct {
 	// gating). The function is invoked on every /readyz request, so it
 	// must be cheap and lock-free.
 	ready func() bool
+	// beginDrain flips /readyz to not-ready on SIGTERM. Nil is a no-op.
+	beginDrain func()
 }
 
 // New builds a Handler from validated config and a Providers bundle. It
@@ -154,6 +197,14 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 			FlushInterval: -1,
 			Rewrite: func(r *httputil.ProxyRequest) {
 				r.SetURL(target)
+				// SetURL JOINS target.Path with the inbound path — it
+				// never strips anything. Routing-only mount prefixes
+				// (like the default /anthropic) must be removed here
+				// or the upstream receives /anthropic/v1/messages and
+				// 404s every request.
+				if u.StripPrefix {
+					stripRoutePrefix(r, u.Prefix, target)
+				}
 				r.Out.Host = target.Host
 				// Hop-by-hop headers are stripped by httputil; we only
 				// add a marker so the upstream can identify llmtap in
@@ -165,6 +216,11 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 				// reaches modify() unparsed and every token / cost
 				// metric records as zero (A6).
 				r.Out.Header.Del("Accept-Encoding")
+				// Drop inbound W3C baggage: clients must not inject
+				// key/value pairs that llmtap would forward upstream
+				// (latent header-injection channel; D29 / FR-17).
+				r.Out.Header.Del("Baggage")
+				r.In.Header.Del("Baggage")
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				if fn, ok := resp.Request.Context().Value(ctxKeyModify).(modifyFn); ok && fn != nil {
@@ -173,11 +229,43 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 				return nil
 			},
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				// Classify before blaming the upstream. A client that
+				// hung up (context canceled) or a request body that
+				// blew the hard cap mid-stream is NOT an upstream
+				// fault — writing an unconditional 502 here fed both
+				// into the circuit breaker as consecutive failures,
+				// so a client-side deploy that cancelled a handful of
+				// in-flight requests opened the circuit against a
+				// healthy upstream: a traffic-correlated false outage.
+				status := http.StatusBadGateway
+				switch {
+				case isBodyTooLargeErr(err):
+					status = http.StatusRequestEntityTooLarge
+				case errors.Is(err, context.Canceled) || r.Context().Err() != nil:
+					status = statusClientClosedRequest
+				}
+				// The GenAI span (when the enriched path started one)
+				// rides the request context; record the transport
+				// error so upstream-down debugging has more than an
+				// empty span with status_code=0.
+				if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+					span.RecordError(err)
+				}
 				logger.WarnContext(r.Context(), "upstream error",
 					slog.String("upstream", target.String()),
+					slog.Int("status", status),
 					slog.Any("err", err),
 				)
-				w.WriteHeader(http.StatusBadGateway)
+				switch status {
+				case http.StatusRequestEntityTooLarge:
+					writeProxyJSONError(w, r, status, "request body exceeds maximum", "body_too_large")
+				case statusClientClosedRequest:
+					// Client already gone — headers only, no body.
+					setCorrelationHeaders(w, r)
+					w.WriteHeader(status)
+				default:
+					writeProxyJSONError(w, r, status, "upstream request failed", "bad_gateway")
+				}
 			},
 		}
 		rps[u.Name] = rp
@@ -185,17 +273,74 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 
 	infl, err := prov.Meter.Int64UpDownCounter(
 		"llmtap.requests.in_flight",
-		metric.WithDescription("Requests currently being proxied through llmtap."),
+		metric.WithDescription("Requests currently being proxied through llmtap (enriched path only)."),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inflight counter: %w", err)
 	}
 	reqs, err := prov.Meter.Int64Counter(
 		"llmtap.requests.total",
-		metric.WithDescription("Total requests handled by llmtap, labelled by upstream and outcome."),
+		metric.WithDescription("Total requests handled by llmtap past the health probes, including passthrough and rejects. Labels: upstream, http.response.status_code."),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("requests counter: %w", err)
+	}
+	rejected, err := prov.Meter.Int64Counter(
+		"llmtap.requests.rejected.total",
+		metric.WithDescription("Requests rejected by llmtap before a normal upstream response. Labels: reason (auth|auth_busy|not_found|breaker_open|concurrency|body_too_large), upstream."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("rejected counter: %w", err)
+	}
+	authRej, err := prov.Meter.Int64Counter(
+		"llmtap.auth.rejected.total",
+		metric.WithDescription("Bearer-token auth failures (HTTP 401). Does not include auth_busy (429)."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("auth rejected counter: %w", err)
+	}
+	bState, err := prov.Meter.Int64Gauge(
+		"llmtap.breaker.state",
+		metric.WithDescription("Per-upstream circuit breaker state: 0=closed, 1=open, 2=half_open."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("breaker state gauge: %w", err)
+	}
+	streams, err := prov.Meter.Int64UpDownCounter(
+		"llmtap.streams.active",
+		metric.WithDescription("Active SSE response streams currently being tee-parsed."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("streams active counter: %w", err)
+	}
+	streamIdle, err := prov.Meter.Int64Counter(
+		"llmtap.streams.idle_timeouts.total",
+		metric.WithDescription("Upstream response bodies closed because no bytes arrived within http.stream_idle_timeout after headers (or between chunks). Labels: upstream."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("stream idle timeouts counter: %w", err)
+	}
+	certNotAfter, err := prov.Meter.Int64Gauge(
+		"llmtap.tls.cert_not_after",
+		metric.WithDescription("Unix seconds of the currently-served TLS leaf certificate NotAfter. Zero when TLS is disabled."),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cert not-after gauge: %w", err)
+	}
+	certReloadFail, err := prov.Meter.Int64Counter(
+		"llmtap.tls.cert_reload_failures.total",
+		metric.WithDescription("Failed TLS certificate hot-reload attempts. The previously loaded cert continues to be served."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cert reload failures counter: %w", err)
+	}
+	priceMisses, err := prov.Meter.Int64Counter(
+		"llmtap.pricing.misses.total",
+		metric.WithDescription("Requests whose token usage could not be priced because the model has no entry in the active pricing catalogue. A rising rate means the cost dashboard is undercounting."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pricing misses counter: %w", err)
 	}
 
 	priceTable, err := pricing.Load(cfg.Pricing.Path, cfg.Pricing.FailOpen)
@@ -208,23 +353,62 @@ func New(cfg config.Config, providers provider.Registry, prov telemetry.Provider
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 
-	return &Handler{
-		cfg:         cfg,
-		providers:   providers,
-		rps:         rps,
-		tracer:      prov.Tracer,
-		meters:      prov.Meters,
-		inflight:    infl,
-		requests:    reqs,
-		logger:      logger,
-		modelLabel:  labels.NewModelLabel(labels.DefaultMaxCardinality),
-		pricing:     priceTable,
-		auth:        verifier,
-		authHeader:  cfg.Auth.HeaderName(),
-		upstreamSem: upstreamSem,
-		breakers:    breakers,
-		ready:       prov.Ready,
-	}, nil
+	h := &Handler{
+		cfg:                cfg,
+		providers:          providers,
+		rps:                rps,
+		tracer:             prov.Tracer,
+		meters:             prov.Meters,
+		inflight:           infl,
+		requests:           reqs,
+		rejected:           rejected,
+		authRejected:       authRej,
+		breakerState:       bState,
+		streamsActive:      streams,
+		streamIdleTimeouts: streamIdle,
+		certNotAfter:       certNotAfter,
+		certReloadFailures: certReloadFail,
+		pricingMisses:      priceMisses,
+		logger:             logger,
+		contentLogger:      prov.Logger,
+		modelLabel:         labels.NewModelLabel(labels.DefaultMaxCardinality),
+		callerLabel:        labels.NewModelLabel(cfg.Attribution.MaxCardinality),
+		pricing:            priceTable,
+		recorder:           replay.NewRecorder(cfg.Recording.Path, redact.Func(redact.Profile(cfg.Content.Redact))),
+		auth:               verifier,
+		authHeader:         cfg.Auth.HeaderName(),
+		upstreamSem:        upstreamSem,
+		breakers:           breakers,
+		ready:              prov.Ready,
+		beginDrain:         prov.BeginDrain,
+	}
+	// Seed breaker gauges at closed and wire trip/recover observability.
+	for name, br := range h.breakers {
+		upstream := name
+		h.setBreakerState(upstream, breakerClosed)
+		br.onTrip = func() {
+			h.setBreakerState(upstream, breakerOpen)
+			h.logger.Warn("circuit breaker tripped",
+				slog.String("upstream", upstream),
+				slog.String("state", "open"),
+			)
+		}
+		br.onRecover = func() {
+			h.setBreakerState(upstream, breakerClosed)
+			h.logger.Info("circuit breaker recovered",
+				slog.String("upstream", upstream),
+				slog.String("state", "closed"),
+			)
+		}
+		br.onHalfOpen = func() {
+			h.setBreakerState(upstream, breakerHalfOpen)
+			h.logger.Info("circuit breaker half-open (probe admitted)",
+				slog.String("upstream", upstream),
+				slog.String("state", "half_open"),
+			)
+		}
+	}
+	return h, nil
 }
 
 // buildUpstreamTransport returns a per-upstream *http.Transport tuned for
@@ -331,6 +515,53 @@ func makeConnVerifier(pins [][]byte) func(cs tls.ConnectionState) error {
 	}
 }
 
+// stripRoutePrefix rewrites the outbound URL so the routing prefix is
+// removed and the remainder is re-joined onto the target's base path.
+// Runs after SetURL, which has already joined target.Path with the full
+// inbound path. r.In carries the untouched inbound request.
+func stripRoutePrefix(r *httputil.ProxyRequest, prefix string, target *url.URL) {
+	rest := strings.TrimPrefix(r.In.URL.Path, strings.TrimSuffix(prefix, "/"))
+	if rest == "" || rest[0] != '/' {
+		rest = "/" + rest
+	}
+	r.Out.URL.Path = strings.TrimSuffix(target.Path, "/") + rest
+	// Drop RawPath: the recomputed Path re-encodes canonically, and a
+	// stale RawPath that disagrees with Path would silently win.
+	r.Out.URL.RawPath = ""
+}
+
+// isBodyTooLargeErr reports whether err is the mid-stream hard-cap
+// abort from capCountingReader. The transport wraps body-read errors
+// on their way out; errors.Is covers wrap chains, the string check
+// covers the transport paths that flatten with %v instead of %w.
+func isBodyTooLargeErr(err error) bool {
+	return errors.Is(err, errBodyTooLarge) ||
+		strings.Contains(err.Error(), errBodyTooLarge.Error())
+}
+
+// canonicalPath normalizes an inbound URL path for routing: dot
+// segments are resolved and empty paths become "/". Routing on the raw
+// path let /v1/../anthropic/... match the /v1 upstream while the
+// upstream's own normalization served something else — routing,
+// enrichment, and forwarding must all agree on one path identity.
+// Trailing slashes survive (path.Clean strips them, proxies must not).
+func canonicalPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	cp := path.Clean(p)
+	if cp == "." {
+		return "/"
+	}
+	if cp[0] != '/' {
+		cp = "/" + cp
+	}
+	if strings.HasSuffix(p, "/") && cp != "/" {
+		cp += "/"
+	}
+	return cp
+}
+
 // matchPin checks the leaf's SPKI sha256 against the pin set. Uses
 // crypto/subtle.ConstantTimeCompare so a partial-match timing oracle
 // can't leak which pin is closest to the peer's actual SPKI digest.
@@ -376,9 +607,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if caller := h.callerForRequest(r); caller != "" {
+		r = r.WithContext(context.WithValue(r.Context(), ctxKeyCaller, caller))
+	}
 	if !h.applyAuthGate(w, r) {
 		return
 	}
+
+	// Canonicalize once, before routing, so routing, enrichment, and
+	// forwarding all see the same path. RawPath is dropped along with
+	// the rewrite: Path re-encodes canonically on the way out.
+	r.URL.Path = canonicalPath(r.URL.Path)
+	r.URL.RawPath = ""
 
 	upstream, rp, ok := h.matchUpstream(w, r)
 	if !ok {
@@ -389,7 +629,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// per-upstream concurrency slot. From here on, every exit path
 	// MUST go through adm.release() so the breaker doesn't get
 	// stuck in half-open with probeInFlight=true.
-	adm, ok := h.admit(w, upstream)
+	adm, ok := h.admit(w, r, upstream)
 	if !ok {
 		return
 	}
@@ -398,9 +638,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// read the final status code that reached the client and fold it
 	// into the breaker. Without this wrapper, transparent passthrough
 	// paths (op=="" and the body-read-error fallback) would never
-	// report anything to the breaker.
+	// report anything to the breaker. The deferred request counter
+	// makes llmtap.requests.total cover passthrough + enriched alike.
 	capW := &statusCaptureWriter{ResponseWriter: w}
-	defer adm.release(capW)
+	defer func() {
+		adm.release(capW)
+		h.recordRequest(r.Context(), upstream.Name, capW.status)
+	}()
 
 	h.dispatch(capW, r, upstream, rp)
 }
@@ -422,13 +666,18 @@ func (h *Handler) applyAuthGate(w http.ResponseWriter, r *http.Request) bool {
 		// the loudest backpressure surface — operators see auth-cost
 		// shedding before the upstream concurrency cap fires.
 		w.Header().Set("Retry-After", "1")
-		http.Error(w, "auth verifier busy", http.StatusTooManyRequests)
+		writeProxyPlainError(w, r, http.StatusTooManyRequests, "auth verifier busy")
+		h.recordRejected(r.Context(), rejectReasonAuthBusy, "")
+		h.recordRequest(r.Context(), "", http.StatusTooManyRequests)
 		return false
 	default:
 		// 401 with no upstream contact. Do not echo the supplied token,
 		// even truncated — a noisy 401 helps an attacker time their
 		// guess.
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeProxyPlainError(w, r, http.StatusUnauthorized, "unauthorized")
+		h.authRejected.Add(r.Context(), 1)
+		h.recordRejected(r.Context(), rejectReasonAuth, "")
+		h.recordRequest(r.Context(), "", http.StatusUnauthorized)
 		return false
 	}
 }
@@ -438,12 +687,18 @@ func (h *Handler) applyAuthGate(w http.ResponseWriter, r *http.Request) bool {
 func (h *Handler) matchUpstream(w http.ResponseWriter, r *http.Request) (config.Upstream, *httputil.ReverseProxy, bool) {
 	upstream, ok := h.cfg.Match(r.URL.Path)
 	if !ok {
+		setCorrelationHeaders(w, r)
 		http.NotFound(w, r)
+		h.recordRejected(r.Context(), rejectReasonNotFound, "")
+		h.recordRequest(r.Context(), "", http.StatusNotFound)
 		return config.Upstream{}, nil, false
 	}
 	rp, ok := h.rps[upstream.Name]
 	if !ok {
+		setCorrelationHeaders(w, r)
 		http.NotFound(w, r)
+		h.recordRejected(r.Context(), rejectReasonNotFound, upstream.Name)
+		h.recordRequest(r.Context(), upstream.Name, http.StatusNotFound)
 		return config.Upstream{}, nil, false
 	}
 	return upstream, rp, true
@@ -470,13 +725,16 @@ type admission struct {
 // breaker should NOT consume a concurrency slot. The order also
 // ensures release() runs in reverse — concurrency slot first
 // (immediately on return), breaker.report last (status code in hand).
-func (h *Handler) admit(w http.ResponseWriter, upstream config.Upstream) (*admission, bool) {
+func (h *Handler) admit(w http.ResponseWriter, r *http.Request, upstream config.Upstream) (*admission, bool) {
 	adm := &admission{br: h.breakers[upstream.Name]}
+	ctx := r.Context()
 	if adm.br != nil {
 		ok, retryAfter := adm.br.admit()
 		if !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-			http.Error(w, "upstream circuit breaker open", http.StatusServiceUnavailable)
+			writeProxyPlainError(w, r, http.StatusServiceUnavailable, "upstream circuit breaker open")
+			h.recordRejected(ctx, rejectReasonBreakerOpen, upstream.Name)
+			h.recordRequest(ctx, upstream.Name, http.StatusServiceUnavailable)
 			return nil, false
 		}
 	}
@@ -493,7 +751,9 @@ func (h *Handler) admit(w http.ResponseWriter, upstream config.Upstream) (*admis
 				adm.br.report(http.StatusTooManyRequests)
 			}
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "upstream concurrency limit reached", http.StatusTooManyRequests)
+			writeProxyPlainError(w, r, http.StatusTooManyRequests, "upstream concurrency limit reached")
+			h.recordRejected(ctx, rejectReasonConcurrency, upstream.Name)
+			h.recordRequest(ctx, upstream.Name, http.StatusTooManyRequests)
 			return nil, false
 		}
 	}
@@ -545,14 +805,17 @@ func (h *Handler) dispatch(w *statusCaptureWriter, r *http.Request, upstream con
 	// configured ceiling, refuse before we drain any bytes. The 413
 	// status flows into release() via the wrapper.
 	if hardCap := h.cfg.Request.MaxBodyBytes; hardCap > 0 && r.ContentLength > hardCap {
-		http.Error(w, "request body exceeds maximum", http.StatusRequestEntityTooLarge)
+		writeProxyJSONError(w, r, http.StatusRequestEntityTooLarge, "request body exceeds maximum", "body_too_large")
+		h.recordRejected(r.Context(), rejectReasonBodyTooLarge, upstream.Name)
 		return
 	}
 
+	originalContentLength := r.ContentLength
 	body, err := captureHeadAndForward(r, h.cfg.Request.MaxBodyBytes)
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
-			http.Error(w, "request body exceeds maximum", http.StatusRequestEntityTooLarge)
+			writeProxyJSONError(w, r, http.StatusRequestEntityTooLarge, "request body exceeds maximum", "body_too_large")
+			h.recordRejected(r.Context(), rejectReasonBodyTooLarge, upstream.Name)
 			return
 		}
 		h.logger.WarnContext(r.Context(), "request body read failed; falling back to transparent proxy",
@@ -568,12 +831,30 @@ func (h *Handler) dispatch(w *statusCaptureWriter, r *http.Request, upstream con
 	)
 
 	contentOpts := provider.ContentOpts{
-		Capture: h.cfg.Content.Mode == config.CaptureEvents,
-		Redact:  redact.Func(redact.Profile(h.cfg.Content.Redact)),
+		CaptureEvents: h.cfg.Content.Mode == config.CaptureEvents,
+		CaptureLogs:   h.cfg.Content.Mode == config.CaptureLogs,
+		Logger:        h.contentLogger,
+		Redact:        redact.Func(redact.Profile(h.cfg.Content.Redact)),
 	}
 	info := prv.ParseRequest(span, r.URL.Path, body, contentOpts)
+	if caller, _ := r.Context().Value(ctxKeyCaller).(string); caller != "" {
+		info.Caller = caller
+		span.SetAttributes(attribute.String(genai.AttrCaller, caller))
+	}
 
-	finalize, modify := h.responseInterceptor(prv, &info, contentOpts, span, upstream.Name)
+	// The fallback closure lets finalize recover the status that the
+	// ErrorHandler wrote when ModifyResponse never ran (upstream dial
+	// failure, mid-body abort) — previously those spans/metrics
+	// recorded status_code=0, blinding operators in exactly the
+	// upstream-down scenario they most need telemetry for.
+	finalize, modify := h.responseInterceptor(prv, &info, contentOpts, span, upstream.Name,
+		replay.Entry{
+			Method: r.Method, Path: r.URL.RequestURI(), Provider: prv.System(),
+			Request: string(body),
+			RequestTruncated: originalContentLength > int64(len(body)) ||
+				(originalContentLength < 0 && len(body) == maxEnrichmentBodyBytes),
+		},
+		func() int { return w.status })
 	ctx = context.WithValue(ctx, ctxKeyModify, modify)
 	rp.ServeHTTP(w, r.WithContext(ctx))
 
@@ -628,7 +909,8 @@ func (s *statusCaptureWriter) Unwrap() http.ResponseWriter {
 	return s.ResponseWriter
 }
 
-// responseInterceptor returns:
+// responseInterceptor builds a requestObserver and returns its
+// Finalize / ModifyResponse method values:
 //   - finalize: must be called once after ServeHTTP returns. It records
 //     metrics and ends the span if the streaming wrapper hasn't already.
 //   - modify: the ReverseProxy.ModifyResponse hook. Typed as modifyFn so
@@ -641,190 +923,12 @@ func (h *Handler) responseInterceptor(
 	content provider.ContentOpts,
 	span trace.Span,
 	upstreamName string,
+	entry replay.Entry,
+	fallbackStatus func() int,
 ) (finalize func(context.Context), modify modifyFn) {
-	var (
-		finalized  atomic.Bool
-		statusCode int
-		// errCapture, when non-nil, indicates the response was an error
-		// (4xx/5xx). It tees a snippet from the body without buffering
-		// the whole thing so the original stream forwards intact.
-		errCapture *snippetCapture
-	)
-
-	finishSpan := func() {
-		if statusCode >= 400 {
-			span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", statusCode))
-		} else if statusCode > 0 {
-			span.SetStatus(codes.Ok, "")
-		}
-		span.SetAttributes(attribute.Int("http.response.status_code", statusCode))
-		if errCapture != nil {
-			span.SetAttributes(attribute.Int("http.response.body_size", errCapture.total))
-			if content.Capture {
-				span.SetAttributes(attribute.String(
-					"http.response.body_snippet",
-					content.Clean(truncateUTF8(string(errCapture.head), 1024)),
-				))
-			}
-		}
-		// The circuit breaker is fed from ServeHTTP's admission release
-		// path (C1) — NOT from here. release() reads the final status
-		// code that reached the client via the statusCaptureWriter
-		// wrapper and folds it into the breaker. That central reporting
-		// is the only thing that prevents transparent-passthrough and
-		// hard-cap-reject paths from leaking the half-open probe slot.
-		span.End()
-	}
-
-	recordMetrics := func(ctx context.Context) {
-		// Bound model-label cardinality before it hits any metric. Pricing
-		// uses the raw model so snapshot suffixes still match the table.
-		reqModelLabel := h.modelLabel.Normalize(info.RequestModel)
-		respModelLabel := h.modelLabel.Normalize(info.ResponseModel)
-		attrs := metric.WithAttributes(
-			attribute.String(genai.AttrSystem, info.System),
-			attribute.String(genai.AttrOperationName, info.Operation),
-			attribute.String(genai.AttrRequestModel, reqModelLabel),
-			attribute.String("upstream", upstreamName),
-			attribute.Int("http.response.status_code", statusCode),
-		)
-		if d := info.DurationSeconds(); d > 0 {
-			h.meters.OperationDuration.Record(ctx, d, attrs)
-		}
-		if t := info.TimeToFirstTokenSeconds(); t > 0 {
-			h.meters.TimeToFirstToken.Record(ctx, t, attrs)
-			span.SetAttributes(attribute.Float64(genai.AttrTimeToFirstToken, t))
-		}
-		if info.InputTokens > 0 {
-			h.meters.TokenUsage.Record(ctx, info.InputTokens, metric.WithAttributes(
-				attribute.String(genai.AttrSystem, info.System),
-				attribute.String(genai.AttrOperationName, info.Operation),
-				attribute.String(genai.AttrRequestModel, reqModelLabel),
-				attribute.String("token_type", genai.TokenTypeInput),
-			))
-		}
-		if info.OutputTokens > 0 {
-			h.meters.TokenUsage.Record(ctx, info.OutputTokens, metric.WithAttributes(
-				attribute.String(genai.AttrSystem, info.System),
-				attribute.String(genai.AttrOperationName, info.Operation),
-				attribute.String(genai.AttrRequestModel, reqModelLabel),
-				attribute.String("token_type", genai.TokenTypeOutput),
-			))
-		}
-		model := info.ResponseModel
-		if model == "" {
-			model = info.RequestModel
-		}
-		if usd, ok := h.pricing.Cost(info.System, model, info.InputTokens, info.OutputTokens); ok {
-			costAttrs := metric.WithAttributes(
-				attribute.String(genai.AttrSystem, info.System),
-				attribute.String(genai.AttrRequestModel, reqModelLabel),
-				attribute.String(genai.AttrResponseModel, respModelLabel),
-			)
-			// Per-call distribution + monotonic cumulative. The
-			// histogram serves p50 / p95 cost dashboards; the
-			// counter sidesteps float drift on the histogram _sum
-			// across millions of small adds.
-			h.meters.CostUSD.Record(ctx, usd, costAttrs)
-			h.meters.CostUSDTotal.Add(ctx, usd, costAttrs)
-			span.SetAttributes(attribute.Float64(genai.AttrCostUSD, usd))
-		}
-		h.requests.Add(ctx, 1, attrs)
-	}
-
-	finalize = func(ctx context.Context) {
-		if !finalized.CompareAndSwap(false, true) {
-			return
-		}
-		if info.Finished.IsZero() {
-			info.Finished = time.Now()
-		}
-		recordMetrics(ctx)
-		finishSpan()
-	}
-
-	modify = func(resp *http.Response) error {
-		statusCode = resp.StatusCode
-		info.FirstByteAt = time.Now()
-		span.SetAttributes(attribute.String(genai.AttrSystem, info.System))
-
-		if statusCode >= 400 {
-			// Error bodies must reach the client byte-for-byte — they
-			// frequently carry the structured detail the caller needs
-			// to debug. We peel off a bounded snippet for the span via
-			// an io.TeeReader; the rest of the bytes flow through
-			// untouched. The snippet itself is gated on captureContent
-			// since OpenAI/Anthropic error bodies routinely echo a
-			// prefix of the offending API key, which would otherwise
-			// leak into traces under the privacy-off default.
-			//
-			// Wrap the body in parseOnClose so finalize() fires on
-			// EOF — before httputil's copy loop reports the body as
-			// drained. Without this, FlushInterval=-1 streams the
-			// error body to the client, the client's ReadAll
-			// returns, and a test that probes rec.Ended()
-			// immediately afterwards sees an empty set because
-			// span.End() hasn't run yet on the server side.
-			streamCtx := context.WithoutCancel(resp.Request.Context())
-			errCapture = &snippetCapture{headCap: 1024}
-			origCloser := resp.Body
-			teed := io.TeeReader(resp.Body, errCapture)
-			resp.Body = &parseOnClose{
-				Reader:  teed,
-				closer:  origCloser,
-				onClose: func() { finalize(streamCtx) },
-			}
-			return nil
-		}
-
-		if isEventStream(resp.Header) {
-			h.activeStreams.Add(1)
-			info.Stream = true
-			// Keep the request's trace context alive for the metric
-			// emission that finalize will do when the stream closes.
-			// `context.WithoutCancel` preserves baggage/span context
-			// while detaching from the request's cancellation chain —
-			// metrics for a completed stream should fire even if the
-			// client has already disconnected.
-			streamCtx := context.WithoutCancel(resp.Request.Context())
-			resp.Body = prv.WrapStream(span, info, resp.Body, content,
-				func() {}, // first-token bookkeeping is internal to provider
-				func() {
-					h.activeStreams.Add(-1)
-					finalize(streamCtx)
-				},
-			)
-			return nil
-		}
-
-		// Non-streaming JSON: stream-through-with-tee. The old
-		// implementation drained the entire body into memory before
-		// returning, which delayed the client's first byte by the
-		// full upstream duration. Now the body forwards through a
-		// TeeReader while a bounded snippetCapture accumulates up
-		// to maxEnrichmentBodyBytes for the parser. The parser and
-		// finalize() both fire as soon as the upstream reader hits
-		// EOF — BEFORE the EOF propagates to httputil's copy loop.
-		// That ordering matters: the server-side write of the
-		// trailing bytes is still in httputil's hands, but the span
-		// is finalised before httputil reports the upstream as
-		// drained, so the very next thing the test (or operator
-		// probe) sees on the span is "ended".
-		streamCtx := context.WithoutCancel(resp.Request.Context())
-		capture := &snippetCapture{headCap: maxEnrichmentBodyBytes}
-		origCloser := resp.Body
-		teed := io.TeeReader(resp.Body, capture)
-		resp.Body = &parseOnClose{
-			Reader: teed,
-			closer: origCloser,
-			onClose: func() {
-				prv.ParseResponseJSON(span, info, capture.head, content)
-				finalize(streamCtx)
-			},
-		}
-		return nil
-	}
-	return finalize, modify
+	o := newRequestObserver(h, prv, info, content, span, upstreamName, fallbackStatus)
+	o.record = entry
+	return o.Finalize, o.ModifyResponse
 }
 
 // parseOnClose wraps a body so the parser runs exactly once, on Close
@@ -987,6 +1091,30 @@ func (c *capCountingReader) Read(p []byte) (int, error) {
 func isEventStream(h http.Header) bool {
 	ct := h.Get("Content-Type")
 	return strings.HasPrefix(ct, "text/event-stream")
+}
+
+func (h *Handler) callerForRequest(r *http.Request) string {
+	if header := h.cfg.Attribution.Header; header != "" {
+		value := strings.TrimSpace(r.Header.Get(header))
+		r.Header.Del(header)
+		if value != "" {
+			return truncateUTF8(value, 128)
+		}
+	}
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		if cn := strings.TrimSpace(r.TLS.PeerCertificates[0].Subject.CommonName); cn != "" {
+			return "mtls:" + truncateUTF8(cn, 120)
+		}
+	}
+	if h.auth.Enabled() {
+		raw := strings.TrimSpace(r.Header.Get(h.authHeader))
+		raw = strings.TrimSpace(strings.TrimPrefix(raw, "Bearer "))
+		if raw != "" {
+			sum := sha256.Sum256([]byte(raw))
+			return "token:" + hex.EncodeToString(sum[:8])
+		}
+	}
+	return ""
 }
 
 // truncateUTF8 trims s to at most n bytes without splitting a multi-byte rune.

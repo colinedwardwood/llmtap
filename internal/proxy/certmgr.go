@@ -173,6 +173,16 @@ func (m *certManager) leafFingerprint() string {
 	return hex.EncodeToString(sum[:])
 }
 
+// leafNotAfter returns the NotAfter of the currently-served leaf, or
+// the zero time when no leaf is loaded / Leaf is unset.
+func (m *certManager) leafNotAfter() time.Time {
+	c := m.cert.Load()
+	if c == nil || c.Leaf == nil {
+		return time.Time{}
+	}
+	return c.Leaf.NotAfter
+}
+
 // checkAndReload is the inner unit factored out of Watch so tests can
 // drive one reload cycle synchronously. It compares current ModTime
 // against the last-seen pair and, on change, reloads. Returns (reloaded,
@@ -206,11 +216,19 @@ func (m *certManager) checkAndReload(logger *slog.Logger) (bool, error) {
 	return true, nil
 }
 
+// certObserver receives successful-load and failure signals from the
+// watcher so metrics / near-expiry warnings stay out of this package's
+// core I/O path. Nil observer methods are no-ops.
+type certObserver interface {
+	observeCert(notAfter time.Time, logger *slog.Logger)
+	recordCertReloadFailure()
+}
+
 // Watch polls every interval and reloads when either file's ModTime has
 // advanced. Returns when ctx is cancelled. interval <= 0 disables the
 // watcher (Watch returns immediately) so operators can opt out without
-// removing the cert paths.
-func (m *certManager) Watch(ctx context.Context, interval time.Duration, logger *slog.Logger) {
+// removing the cert paths. obs may be nil.
+func (m *certManager) Watch(ctx context.Context, interval time.Duration, logger *slog.Logger, obs certObserver) {
 	if interval <= 0 {
 		return
 	}
@@ -221,11 +239,21 @@ func (m *certManager) Watch(ctx context.Context, interval time.Duration, logger 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := m.checkAndReload(logger); err != nil && logger != nil {
-				logger.Warn("tls certificate reload failed",
-					slog.String("cert_path", m.certPath),
-					slog.Any("err", err),
-				)
+			reloaded, err := m.checkAndReload(logger)
+			if err != nil {
+				if obs != nil {
+					obs.recordCertReloadFailure()
+				}
+				if logger != nil {
+					logger.Warn("tls certificate reload failed",
+						slog.String("cert_path", m.certPath),
+						slog.Any("err", err),
+					)
+				}
+				continue
+			}
+			if reloaded && obs != nil {
+				obs.observeCert(m.leafNotAfter(), logger)
 			}
 		}
 	}

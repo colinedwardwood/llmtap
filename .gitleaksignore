@@ -1,0 +1,5 @@
+# Synthetic test fixtures only (verified 2026-10-30) — not real credentials.
+# Redaction tests need secret-shaped input; the smoke test uses a fake bearer token.
+internal/redact/redact_test.go:private-key:109
+internal/redact/redact_test.go:generic-api-key:112
+test/smoke/smoke.sh:curl-auth-header:39

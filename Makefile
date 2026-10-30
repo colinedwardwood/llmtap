@@ -25,8 +25,15 @@ all: lint test build
 build:
 	$(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN) $(CMD)
 
+# Uses config.yaml if you've created one, otherwise falls back to the
+# checked-in example so `git clone && make run` works immediately.
 run: build
-	./$(BIN) up --config config.yaml
+	@if [ -f config.yaml ]; then \
+	  ./$(BIN) up --config config.yaml; \
+	else \
+	  echo "config.yaml not found; using config.example.yaml"; \
+	  ./$(BIN) up --config config.example.yaml; \
+	fi
 
 test:
 	$(GO) test $(TESTOPTS) ./...

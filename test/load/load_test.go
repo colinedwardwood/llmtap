@@ -41,7 +41,7 @@ import (
 	"github.com/colinedwardwood/llmtap/internal/proxy"
 	"github.com/colinedwardwood/llmtap/internal/telemetry"
 
-	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -73,23 +73,20 @@ func envInt(t *testing.T, key string, def int) int {
 
 func fakeProv() telemetry.Providers {
 	tp := sdktrace.NewTracerProvider()
-	meter := noop.NewMeterProvider().Meter("noop")
-	tokens, _ := meter.Int64Histogram("tu")
-	dur, _ := meter.Float64Histogram("du")
-	ttft, _ := meter.Float64Histogram("ttft")
-	cost, _ := meter.Float64Histogram("cost")
-	costTotal, _ := meter.Float64Counter("cost.total")
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	meter := mp.Meter("load")
+	meters, err := telemetry.NewGenAIMeters(meter)
+	if err != nil {
+		panic(err)
+	}
 	return telemetry.Providers{
 		Tracer: tp.Tracer("load"),
 		Meter:  meter,
-		Meters: telemetry.GenAIMeters{
-			TokenUsage:        tokens,
-			OperationDuration: dur,
-			TimeToFirstToken:  ttft,
-			CostUSD:           cost,
-			CostUSDTotal:      costTotal,
+		Meters: meters,
+		Shutdown: func(context.Context) error {
+			return mp.Shutdown(context.Background())
 		},
-		Shutdown: func(context.Context) error { return nil },
 	}
 }
 
@@ -274,4 +271,57 @@ func post(url, body string) (status int, err error) {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode, nil
+}
+
+// TestLoadStreaming exercises SSE through the proxy with real SDK
+// meters and asserts heap growth stays bounded (D33).
+func TestLoadStreaming(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping streaming load test in -short mode")
+	}
+	const streamChunk = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, streamChunk)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Default()
+	cfg.Upstreams = []config.Upstream{{
+		Name: "openai", Prefix: "/v1", Target: upstream.URL, Provider: "openai",
+	}}
+	h, err := proxy.New(cfg, provider.BuiltIn(), fakeProv(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	runtime.GC()
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	for i := 0; i < 100; i++ {
+		resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+
+	runtime.GC()
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	heapDelta := int64(memAfter.HeapAlloc) - int64(memBefore.HeapAlloc)
+	// 32 MiB ceiling — streaming should not retain per-request bodies.
+	const maxHeapGrowth = 32 * 1024 * 1024
+	if heapDelta > maxHeapGrowth {
+		t.Errorf("heap growth = %d bytes, want <= %d", heapDelta, maxHeapGrowth)
+	}
+	t.Logf("streaming load: 100 requests heap_delta=%d", heapDelta)
 }

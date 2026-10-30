@@ -6,7 +6,7 @@
 # Replaces the TLS-on-:4443 default with plaintext-on-:4000 +
 # LLMTAP_ALLOW_INSECURE=true. Use this only for a 30-second
 # `curl http://localhost:4000/v1/...` demo — it teaches the wrong
-# trust model for production, which is exactly what A14 was fixing.
+# trust model for production, which is why TLS is the compose default.
 services:
   llmtap:
     ports: !override
@@ -19,6 +19,7 @@ services:
       LLMTAP_OTLP_ENDPOINT: "otel-collector:4317"
       LLMTAP_OTLP_PROTOCOL: "grpc"
       LLMTAP_OTLP_INSECURE: "true"
+      LLMTAP_OTLP_ACKNOWLEDGE_INSECURE: "true"
       LLMTAP_CAPTURE: "off"
       LLMTAP_ENV: "demo"
     depends_on:

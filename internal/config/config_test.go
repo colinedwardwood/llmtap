@@ -75,6 +75,51 @@ func TestEnvOverrides(t *testing.T) {
 	}
 }
 
+// TestLoadPrecedenceEnvOverYAML pins defaults → YAML → env (D30).
+func TestLoadPrecedenceEnvOverYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	body := []byte(`
+listen: "127.0.0.1:8888"
+telemetry:
+  endpoint: yaml-host:4317
+  protocol: grpc
+  insecure: true
+  acknowledge_insecure: true
+content:
+  mode: off
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLMTAP_LISTEN", "127.0.0.1:7777")
+	t.Setenv("LLMTAP_CAPTURE", "logs")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Listen != "127.0.0.1:7777" {
+		t.Errorf("listen = %q, env should win", cfg.Listen)
+	}
+	if cfg.Content.Mode != CaptureLogs {
+		t.Errorf("content.mode = %q, env should win", cfg.Content.Mode)
+	}
+	if cfg.Telemetry.Endpoint != "yaml-host:4317" {
+		t.Errorf("endpoint = %q, yaml should stick when env unset", cfg.Telemetry.Endpoint)
+	}
+}
+
+func TestAttributionHeaderCannotConsumeCredentials(t *testing.T) {
+	t.Parallel()
+	for _, header := range []string{"Authorization", "authorization"} {
+		cfg := Default()
+		cfg.Attribution.Header = header
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("header %q accepted", header)
+		}
+	}
+}
+
 // TestEnvOverridesOTLPHeaders covers the L1 low-tier env var. Headers
 // come from container orchestrators where YAML is awkward and the
 // classic `valueFrom: secretKeyRef` path is via env.

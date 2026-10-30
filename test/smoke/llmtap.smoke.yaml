@@ -1,0 +1,24 @@
+# llmtap config for the compose smoke test: the single upstream points
+# at the stub service instead of api.openai.com. Everything else
+# (listen address, OTLP endpoint) comes from the compose overlay's
+# LLMTAP_* env vars, which take precedence over this file.
+listen: "0.0.0.0:4000"
+allow_insecure: true
+
+upstreams:
+  - name: stub
+    prefix: /v1
+    target: http://stub:9999
+    provider: openai
+
+telemetry:
+  endpoint: "otel-collector:4317"
+  protocol: grpc
+  insecure: true
+  # "otel-collector" is a docker-network alias; validation treats
+  # hostnames conservatively as non-local, so acknowledge explicitly.
+  acknowledge_insecure: true
+
+content:
+  mode: off
+  redact: default

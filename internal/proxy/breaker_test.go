@@ -133,8 +133,10 @@ func TestBreakerHalfOpenAdmitsOneProbe(t *testing.T) {
 		t.Fatalf("warmup hits = %d, want 2", upstreamHits.Load())
 	}
 
-	// Wait for RecoveryWindow to expire.
-	time.Sleep(recovery + 5*time.Millisecond)
+	// Wait for RecoveryWindow to expire. Buffer past the window so
+	// heavily-loaded -count / -race suites don't both race as "still
+	// open" and produce two 503s with zero probe admissions.
+	time.Sleep(recovery + 30*time.Millisecond)
 
 	// Fire two concurrent requests. One should be admitted as a
 	// probe; the other must reject with 503.

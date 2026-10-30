@@ -3,10 +3,20 @@
 //
 // Each implementation owns the wire details of one provider family. Adding a
 // new family means writing one file plus a registration in [BuiltIn].
+//
+// Parsing is deliberately split from span emission:
+//
+//	decode*() → typed structs / [Info]  (pure, span-free — record/replay)
+//	emit*()   → span attributes/events  (side-effecting)
+//
+// The [Provider] methods compose decode+emit so the proxy keeps a single
+// call site. Tests (and future B2 record/replay) can call the decode
+// helpers directly.
 package provider
 
 import (
 	"io"
+	"sort"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -20,19 +30,45 @@ import (
 // Zero values mean "unknown" (e.g. tokens=0 from a 4xx, finish reasons empty
 // when streaming aborted). The proxy reports only fields that are known.
 type Info struct {
-	System        string
-	Operation     string
-	RequestModel  string
-	ResponseModel string
-	ResponseID    string
-	FinishReasons []string
-	InputTokens   int64
-	OutputTokens  int64
-	Stream        bool
-	Started       time.Time
-	FirstByteAt   time.Time // wall-clock of first response byte; zero if not measured
-	FirstTokenAt  time.Time // wall-clock of first content delta in stream; zero if non-streaming
-	Finished      time.Time
+	System                   string
+	API                      string
+	Operation                string
+	RequestModel             string
+	ResponseModel            string
+	ResponseID               string
+	FinishReasons            []string
+	InputTokens              int64
+	OutputTokens             int64
+	CacheReadInputTokens     int64
+	CacheCreationInputTokens int64
+	ReasoningOutputTokens    int64
+	ErrorType                string
+	ServiceTier              string
+	Refusal                  string
+	Caller                   string
+	Stream                   bool
+	// Params holds request sampling / generation knobs decoded from
+	// the body. Kept as a bag so emit and cost-weighted sampling can
+	// read them without re-parsing the wire format.
+	Params       RequestParams
+	Started      time.Time
+	FirstByteAt  time.Time // wall-clock of first response byte; zero if not measured
+	FirstTokenAt time.Time // wall-clock of first content delta in stream; zero if non-streaming
+	Finished     time.Time
+}
+
+// RequestParams is the provider-neutral bag of generation knobs. Pointer
+// and slice fields distinguish "absent" from "explicitly zero" / empty.
+type RequestParams struct {
+	Temperature      *float64
+	TopP             *float64
+	TopK             *int64
+	MaxTokens        *int64
+	FrequencyPenalty *float64
+	PresencePenalty  *float64
+	Seed             *int64
+	StopSequences    []string
+	EncodingFormats  []string
 }
 
 // DurationSeconds returns Finished-Started in seconds; 0 if either is zero.
@@ -52,35 +88,24 @@ func (i Info) TimeToFirstTokenSeconds() float64 {
 	return i.FirstTokenAt.Sub(i.Started).Seconds()
 }
 
-// ContentOpts shapes how providers handle prompt/completion content
-// when populating span events.
-type ContentOpts struct {
-	// Capture controls whether content events are emitted at all. When
-	// false, providers attach only metadata (model, parameters, token
-	// counts) — never content.
-	Capture bool
-	// Redact, if non-nil, is applied to every captured content string
-	// before it reaches a span attribute. nil is interpreted as
-	// passthrough (no redaction). Callers should populate this from
-	// internal/redact.Func so the privacy default isn't "off by
-	// accident".
-	Redact func(string) string
+// TimeToFirstByteSeconds returns FirstByteAt-Started in seconds; 0 if
+// ModifyResponse never observed an upstream response.
+func (i Info) TimeToFirstByteSeconds() float64 {
+	if i.Started.IsZero() || i.FirstByteAt.IsZero() {
+		return 0
+	}
+	return i.FirstByteAt.Sub(i.Started).Seconds()
 }
 
-// Clean returns s with the configured redactor applied, or s unchanged
-// when Redact is nil. Providers should funnel every captured content
-// string through this method on the way to a span attribute.
-func (o ContentOpts) Clean(s string) string {
-	if o.Redact == nil {
-		return s
-	}
-	return o.Redact(s)
-}
+// ContentOpts shapes how providers handle prompt/completion content.
+// See capture.go for the struct definition and emit helpers.
 
 // Provider is the parser contract. Implementations are stateless; per-call
-// state lives on [Info].
+// state lives on [Info]. Parse*/WrapStream compose decode + emit so the
+// proxy has a single call site; decode helpers are available for pure
+// parsing (tests, record/replay).
 type Provider interface {
-	// System returns the gen_ai.system value (e.g. "openai", "anthropic").
+	// System returns the gen_ai.provider.name value (e.g. "openai", "anthropic").
 	System() string
 
 	// OperationFor maps a request path to the GenAI operation name. Returns
@@ -100,16 +125,15 @@ type Provider interface {
 	ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts)
 
 	// WrapStream returns a reader that proxies body to the caller unchanged
-	// while parsing SSE events out-of-band. onFirstToken is invoked once
-	// when the first content delta is observed; onDone is invoked exactly
+	// while parsing SSE events out-of-band. onDone is invoked exactly
 	// once when the stream completes (EOF, error, or Close), with info
-	// fully populated. Both callbacks must be cheap and non-blocking.
+	// fully populated. The callback must be cheap and non-blocking.
+	// First-token bookkeeping (TTFT) is internal to the stream collector.
 	WrapStream(
 		span trace.Span,
 		info *Info,
 		body io.ReadCloser,
 		content ContentOpts,
-		onFirstToken func(),
 		onDone func(),
 	) io.ReadCloser
 }
@@ -118,10 +142,37 @@ type Provider interface {
 // implementation. BuiltIn returns the v0.1 set.
 type Registry map[string]Provider
 
+const (
+	APIChatCompletions = "chat_completions"
+	APIResponses       = "responses"
+	APIEmbeddings      = "embeddings"
+)
+
 // BuiltIn returns the registry of providers that ship with llmtap.
 func BuiltIn() Registry {
 	return Registry{
 		"openai":    &OpenAI{},
 		"anthropic": &Anthropic{},
+		"gemini":    &Gemini{},
 	}
+}
+
+// Known reports whether name is a built-in provider. Config validation
+// uses this instead of hardcoding the name list, so adding a provider
+// to BuiltIn is the only registration step.
+func Known(name string) bool {
+	_, ok := BuiltIn()[name]
+	return ok
+}
+
+// KnownNames returns the sorted list of built-in provider names for
+// error messages.
+func KnownNames() []string {
+	r := BuiltIn()
+	names := make([]string, 0, len(r))
+	for n := range r {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }

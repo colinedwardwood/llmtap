@@ -22,17 +22,25 @@ import (
 //go:embed prices.yaml
 var embeddedPrices []byte
 
+// Snapshot is the date of the embedded price catalogue. Surfaced by
+// `llmtap version` so operators can tell at a glance whether the
+// built-in rates predate the models they're running — stale pricing
+// undercounts spend exactly when it grows.
+const Snapshot = "2026-07"
+
 // Rate is a model's input/output price in USD per 1M tokens. YAML
 // field names match the documented operator-facing schema.
 type Rate struct {
-	InputUSDPerMTok  float64 `yaml:"input_usd_per_mtok"`
-	OutputUSDPerMTok float64 `yaml:"output_usd_per_mtok"`
+	InputUSDPerMTok         float64 `yaml:"input_usd_per_mtok"`
+	OutputUSDPerMTok        float64 `yaml:"output_usd_per_mtok"`
+	CachedInputUSDPerMTok   float64 `yaml:"cached_input_usd_per_mtok,omitempty"`
+	CacheCreationUSDPerMTok float64 `yaml:"cache_creation_input_usd_per_mtok,omitempty"`
 }
 
 // Table is the active pricing catalogue. Construct via Default for the
 // embedded defaults, or via Load to merge an operator override on top.
 type Table struct {
-	// rates is keyed by gen_ai.system then by model-prefix. The map
+	// rates is keyed by gen_ai.provider.name then by model-prefix. The map
 	// preserves O(1) system membership and supports the merge path
 	// in Load.
 	rates map[string]map[string]Rate
@@ -183,11 +191,39 @@ func Load(path string, failOpen bool) (*Table, error) {
 // table. ok is false if no rate exists for (system, model); callers
 // should skip cost emission in that case.
 func (t *Table) Cost(system, model string, inputTokens, outputTokens int64) (usd float64, ok bool) {
+	return t.CostDetailed(system, model, inputTokens, outputTokens, 0, 0)
+}
+
+// CostDetailed prices cached input separately when the catalogue contains
+// cached_input_usd_per_mtok. inputTokens is the provider-reported total,
+// including cached tokens. Reasoning tokens are normally included in the
+// provider's output total and must not be added a second time.
+func (t *Table) CostDetailed(system, model string, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int64) (usd float64, ok bool) {
 	r, found := t.lookup(system, model)
 	if !found {
 		return 0, false
 	}
-	usd = (float64(inputTokens)/1_000_000)*r.InputUSDPerMTok +
+	if cacheReadTokens < 0 {
+		cacheReadTokens = 0
+	}
+	if cacheCreationTokens < 0 {
+		cacheCreationTokens = 0
+	}
+	if cacheReadTokens+cacheCreationTokens > inputTokens {
+		return 0, false
+	}
+	uncachedTokens := inputTokens - cacheReadTokens - cacheCreationTokens
+	cachedRate := r.CachedInputUSDPerMTok
+	if cachedRate == 0 {
+		cachedRate = r.InputUSDPerMTok
+	}
+	creationRate := r.CacheCreationUSDPerMTok
+	if creationRate == 0 {
+		creationRate = r.InputUSDPerMTok
+	}
+	usd = (float64(uncachedTokens)/1_000_000)*r.InputUSDPerMTok +
+		(float64(cacheReadTokens)/1_000_000)*cachedRate +
+		(float64(cacheCreationTokens)/1_000_000)*creationRate +
 		(float64(outputTokens)/1_000_000)*r.OutputUSDPerMTok
 	return usd, true
 }
@@ -198,11 +234,4 @@ func (t *Table) lookup(system, model string) (Rate, bool) {
 		return Rate{}, false
 	}
 	return root.lookup(strings.ToLower(model))
-}
-
-// Cost is a backwards-compatible package-level alias that resolves
-// against the embedded built-in table. Code paths that need an
-// operator-overridable table should hold a *Table directly.
-func Cost(system, model string, inputTokens, outputTokens int64) (usd float64, ok bool) {
-	return defaultTable.Cost(system, model, inputTokens, outputTokens)
 }

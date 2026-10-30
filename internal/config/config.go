@@ -6,14 +6,18 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/colinedwardwood/llmtap/internal/provider"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,15 +35,36 @@ type Config struct {
 	Request       Request        `yaml:"request"`
 	Pricing       Pricing        `yaml:"pricing"`
 	Auth          Auth           `yaml:"auth"`
+	Attribution   Attribution    `yaml:"attribution"`
+	Recording     Recording      `yaml:"recording"`
+}
+
+type Recording struct {
+	// Path enables append-only JSONL request/response recording. Payloads
+	// always pass through Content.Redact before being written.
+	Path string `yaml:"path"`
+}
+
+// Attribution selects the caller identity attached to spans and metrics.
+// Priority is configured header, mTLS certificate CN, then a one-way
+// fingerprint of the listener auth token.
+type Attribution struct {
+	Header         string `yaml:"header"`
+	MaxCardinality int    `yaml:"max_cardinality"`
 }
 
 // Auth controls listener-side bearer-token authentication. When Tokens
-// is non-empty, every request must present a matching token in the
-// configured Header, or the proxy responds 401 with no upstream call.
-// Stored tokens are argon2id PHC hashes — generate with
-// `llmtap hash-token`.
+// is non-empty (after merging TokensFile), every request must present a
+// matching token in the configured Header, or the proxy responds 401
+// with no upstream call. Stored tokens are argon2id PHC hashes —
+// generate with `llmtap hash-token`.
 type Auth struct {
 	Tokens []string `yaml:"tokens"`
+	// TokensFile is an optional path to a file containing additional
+	// PHC hashes, one per line (`#` comments and blank lines ignored).
+	// Intended for Kubernetes Secret mounts so hashes never live in
+	// the ConfigMap. Entries are appended to Tokens at Load time.
+	TokensFile string `yaml:"tokens_file"`
 	// Header is the request header llmtap reads the bearer token from.
 	// Default `X-LLMTAP-Token` keeps the upstream `Authorization`
 	// header untouched so the LLM API key still reaches the upstream
@@ -107,11 +132,19 @@ type Upstream struct {
 	Prefix   string `yaml:"prefix"`
 	Target   string `yaml:"target"`
 	Provider string `yaml:"provider"`
+	// StripPrefix removes Prefix from the path before forwarding, so an
+	// inbound /anthropic/v1/messages reaches the upstream as
+	// /v1/messages. Leave false when the mount prefix IS the upstream's
+	// real base path (the /v1 → api.openai.com case, where the joined
+	// path is already correct). httputil's SetURL only ever JOINS
+	// paths; without this flag a routing-only prefix like /anthropic
+	// is forwarded verbatim and the upstream 404s every request.
+	StripPrefix bool `yaml:"strip_prefix"`
 	// MaxInFlight caps the concurrent in-flight requests llmtap will
 	// forward to this upstream. Above the cap the proxy replies
 	// 429 + Retry-After: 1 without contacting upstream. Zero (default)
 	// disables the cap. The fuse pairs with the per-upstream circuit
-	// breaker (A24) — without it, an upstream brownout consumes every
+	// breaker — without it, an upstream brownout consumes every
 	// goroutine + memory slice the proxy has.
 	MaxInFlight int `yaml:"max_in_flight"`
 	// PinSHA256 is an optional list of base16-encoded SPKI SHA-256
@@ -122,7 +155,7 @@ type Upstream struct {
 	// chain verification untouched. Each entry must be exactly 64
 	// hex characters (32 bytes).
 	PinSHA256 []string `yaml:"pin_sha256"`
-	// Breaker configures the per-upstream circuit breaker (A24). The
+	// Breaker configures the per-upstream circuit breaker. The
 	// breaker trips after Failures consecutive 5xx responses within
 	// Window; while open, requests short-circuit to 503 +
 	// Retry-After. After RecoveryWindow the breaker enters half-open
@@ -158,6 +191,11 @@ type Telemetry struct {
 	Headers     Headers       `yaml:"headers"`
 	SampleRatio float64       `yaml:"sample_ratio"`
 	Timeout     time.Duration `yaml:"timeout"`
+	// Priority sampling records every span in-process, then keeps errors,
+	// slow requests, and expensive requests at export time. SampleRatio
+	// remains the deterministic baseline for all other spans.
+	CostSampleThresholdUSD float64       `yaml:"cost_sample_threshold_usd"`
+	SlowSampleThreshold    time.Duration `yaml:"slow_sample_threshold"`
 	// AcknowledgeInsecure explicitly opts the operator into plaintext
 	// OTLP to a non-loopback / non-RFC1918 endpoint. The default refuses
 	// that combination — exporting prompts and trace metadata over the
@@ -172,9 +210,9 @@ type Headers map[string]string
 // privacy-preserving: capture metadata only, never content. See OTel GenAI
 // semconv: GEN_AI_CAPTURE_MESSAGE_CONTENT.
 type ContentCapture struct {
-	// Mode is one of "off", "events", "logs". "off" emits only metadata
-	// (model, tokens, finish reasons). "events" attaches content as span
-	// events. "logs" emits content via the OTel log signal.
+	// Mode is one of "off", "events", "logs". "off" emits only metadata.
+	// "events" attaches content as span events. "logs" emits content via
+	// the OTel log signal so collectors can scope retention separately.
 	Mode string `yaml:"mode"`
 	// Redact selects the redaction profile applied to every captured
 	// content string before it reaches a span attribute or the
@@ -193,8 +231,8 @@ type HTTPTimeouts struct {
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
 	// BodyReadTimeout bounds how long the proxy waits for the inbound
 	// request body to arrive. Zero or negative disables the deadline
-	// (pre-A11 behaviour). Default 30 s tolerates legitimately large
-	// multimodal uploads while killing slowloris-style holds.
+	// entirely. Default 30 s tolerates legitimately large multimodal
+	// uploads while killing slowloris-style holds.
 	BodyReadTimeout time.Duration `yaml:"body_read_timeout"`
 	// CertReloadInterval is how often the cert manager polls the cert /
 	// key files for ModTime changes and reloads them in place. Zero
@@ -202,6 +240,13 @@ type HTTPTimeouts struct {
 	// Default 30 s is short enough to catch cert-manager renewals
 	// quickly, long enough to be invisible in stat noise.
 	CertReloadInterval time.Duration `yaml:"cert_reload_interval"`
+	// StreamIdleTimeout is the maximum silence between upstream body
+	// bytes after response headers. If a stream stalls longer than
+	// this, the proxy closes it so concurrency slots and WaitForStreams
+	// cannot wedge forever. Zero disables. Default 5m covers long
+	// thinking / tool pauses without letting a hung upstream pin a
+	// slot indefinitely.
+	StreamIdleTimeout time.Duration `yaml:"stream_idle_timeout"`
 }
 
 // Service identifies llmtap to the OTel backend (resource attributes).
@@ -221,6 +266,7 @@ const (
 
 	ProviderOpenAI    = "openai"
 	ProviderAnthropic = "anthropic"
+	ProviderGemini    = "gemini"
 )
 
 // Default returns a config with sensible defaults for local development.
@@ -233,8 +279,13 @@ func Default() Config {
 	return Config{
 		Listen: "127.0.0.1:4000",
 		Upstreams: []Upstream{
+			// /v1 doubles as OpenAI's real base path, so the joined
+			// forward path is already correct — no strip.
 			{Name: "openai", Prefix: "/v1", Target: "https://api.openai.com", Provider: ProviderOpenAI},
-			{Name: "anthropic", Prefix: "/anthropic", Target: "https://api.anthropic.com", Provider: ProviderAnthropic},
+			// /anthropic is a routing-only mount: the SDK requests
+			// /anthropic/v1/messages and the upstream expects
+			// /v1/messages, so the prefix must be stripped.
+			{Name: "anthropic", Prefix: "/anthropic", Target: "https://api.anthropic.com", Provider: ProviderAnthropic, StripPrefix: true},
 		},
 		Telemetry: Telemetry{
 			Endpoint:    "localhost:4317",
@@ -250,6 +301,7 @@ func Default() Config {
 			ShutdownTimeout:    30 * time.Second,
 			BodyReadTimeout:    30 * time.Second,
 			CertReloadInterval: 30 * time.Second,
+			StreamIdleTimeout:  5 * time.Minute,
 		},
 		Service: Service{
 			Name:      "llmtap",
@@ -274,17 +326,69 @@ func Load(path string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("read config %q: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		// KnownFields: a typo'd key (max_inflight, stripprefix) must
+		// fail loudly, not silently leave the default in place. YAML
+		// config that "loads fine" while ignoring the operator's
+		// intent is worse than a crash.
+		dec := yaml.NewDecoder(bytes.NewReader(raw))
+		dec.KnownFields(true)
+		if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 			return Config{}, fmt.Errorf("parse config %q: %w", path, err)
 		}
 	}
 
 	applyEnv(&cfg)
 
+	if err := resolveAuthTokens(&cfg); err != nil {
+		return Config{}, err
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// resolveAuthTokens appends PHC hashes from Auth.TokensFile (and
+// LLMTAP_AUTH_TOKENS_FILE when set via applyEnv) into Auth.Tokens so
+// the rest of the binary only ever sees a flat allow-list.
+func resolveAuthTokens(cfg *Config) error {
+	path := cfg.Auth.TokensFile
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("auth.tokens_file %q: %w", path, err)
+	}
+	extra, err := parseTokensFile(raw)
+	if err != nil {
+		return fmt.Errorf("auth.tokens_file %q: %w", path, err)
+	}
+	cfg.Auth.Tokens = append(cfg.Auth.Tokens, extra...)
+	return nil
+}
+
+func parseTokensFile(raw []byte) ([]string, error) {
+	var out []string
+	for i, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "$argon2") {
+			return nil, fmt.Errorf("line %d: expected argon2 PHC hash, got %q", i+1, truncateForErr(line, 32))
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+func truncateForErr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // applyEnv mutates cfg in place from LLMTAP_* environment variables. Only
@@ -297,6 +401,8 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("LLMTAP_ALLOW_INSECURE"); ok {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.AllowInsecure = b
+		} else {
+			warnEnv("LLMTAP_ALLOW_INSECURE", v, "not a boolean; keeping previous value")
 		}
 	}
 	if v, ok := os.LookupEnv("LLMTAP_TLS_CERT_FILE"); ok {
@@ -317,6 +423,19 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("LLMTAP_OTLP_INSECURE"); ok {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.Telemetry.Insecure = b
+		} else {
+			warnEnv("LLMTAP_OTLP_INSECURE", v, "not a boolean; keeping previous value")
+		}
+	}
+	if v, ok := os.LookupEnv("LLMTAP_OTLP_ACKNOWLEDGE_INSECURE"); ok {
+		// Needed for env-only deployments (containers) whose collector
+		// endpoint is a non-"localhost" hostname: validation can't
+		// know a docker-network alias is private, so the operator
+		// acknowledges plaintext explicitly.
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Telemetry.AcknowledgeInsecure = b
+		} else {
+			warnEnv("LLMTAP_OTLP_ACKNOWLEDGE_INSECURE", v, "not a boolean; keeping previous value")
 		}
 	}
 	if v, ok := os.LookupEnv("LLMTAP_OTLP_HEADERS"); ok {
@@ -332,7 +451,11 @@ func applyEnv(cfg *Config) {
 			}
 			k, val, ok := strings.Cut(pair, "=")
 			if !ok {
-				continue // malformed pair — skip silently, env never crashes
+				// Env never crashes the process, but a dropped auth
+				// header (typo'd X-Scope-OrgID) silently sends
+				// telemetry to the wrong tenant — say something.
+				warnEnv("LLMTAP_OTLP_HEADERS", pair, "malformed pair (want k=v); skipping")
+				continue
 			}
 			headers[strings.TrimSpace(k)] = strings.TrimSpace(val)
 		}
@@ -341,7 +464,9 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	if v, ok := os.LookupEnv("LLMTAP_SAMPLE_RATIO"); ok {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
+		if f, err := strconv.ParseFloat(v, 64); err != nil {
+			warnEnv("LLMTAP_SAMPLE_RATIO", v, "not a number; keeping previous value")
+		} else {
 			// Sampling is not a correctness knob; out-of-range
 			// values clamp rather than refuse startup. Validate's
 			// stricter check is intentionally bypassed here because
@@ -370,6 +495,39 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("LLMTAP_ENV"); ok {
 		cfg.Service.Env = v
 	}
+	if v, ok := os.LookupEnv("LLMTAP_AUTH_TOKENS_FILE"); ok {
+		cfg.Auth.TokensFile = v
+	}
+	if v, ok := os.LookupEnv("LLMTAP_ATTRIBUTION_HEADER"); ok {
+		cfg.Attribution.Header = v
+	}
+	if v, ok := os.LookupEnv("LLMTAP_RECORDING_PATH"); ok {
+		cfg.Recording.Path = v
+	}
+	if v, ok := os.LookupEnv("LLMTAP_COST_SAMPLE_THRESHOLD_USD"); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Telemetry.CostSampleThresholdUSD = f
+		} else {
+			warnEnv("LLMTAP_COST_SAMPLE_THRESHOLD_USD", v, "not a number; keeping previous value")
+		}
+	}
+	if v, ok := os.LookupEnv("LLMTAP_SLOW_SAMPLE_THRESHOLD"); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Telemetry.SlowSampleThreshold = d
+		} else {
+			warnEnv("LLMTAP_SLOW_SAMPLE_THRESHOLD", v, "not a duration; keeping previous value")
+		}
+	}
+}
+
+// warnEnv reports an environment value the loader could not honour.
+// Env overrides never crash the process (they often come from
+// string-typed orchestrators), but silently keeping the previous value
+// while the operator believes the env "took" is a debugging trap —
+// matching the LLMTAP_SAMPLE_RATIO clamping precedent, we say so on
+// stderr.
+func warnEnv(name, value, reason string) {
+	fmt.Fprintf(os.Stderr, "config: %s=%q %s\n", name, value, reason)
 }
 
 // Validate reports the first violation it finds. The caller surfaces it to
@@ -425,13 +583,20 @@ func (c *Config) Validate() error {
 		} else {
 			seenPrefix[u.Prefix] = u.Name
 		}
-		if _, err := url.Parse(u.Target); err != nil || u.Target == "" {
+		// url.Parse accepts nearly anything ("api.openai.com" parses
+		// as a relative path with no host, and the proxy would then
+		// dial ""), so require an absolute http(s) URL with a host.
+		switch tu, err := url.Parse(u.Target); {
+		case err != nil || u.Target == "":
 			errs = append(errs, fmt.Errorf("upstreams[%d].target %q: invalid URL", i, u.Target))
+		case tu.Scheme != "http" && tu.Scheme != "https":
+			errs = append(errs, fmt.Errorf("upstreams[%d].target %q: scheme must be http or https (did you forget \"https://\"?)", i, u.Target))
+		case tu.Host == "":
+			errs = append(errs, fmt.Errorf("upstreams[%d].target %q: missing host", i, u.Target))
 		}
-		switch u.Provider {
-		case ProviderOpenAI, ProviderAnthropic:
-		default:
-			errs = append(errs, fmt.Errorf("upstreams[%d].provider %q: unsupported (want openai|anthropic)", i, u.Provider))
+		if !provider.Known(u.Provider) {
+			errs = append(errs, fmt.Errorf("upstreams[%d].provider %q: unsupported (want %s)",
+				i, u.Provider, strings.Join(provider.KnownNames(), "|")))
 		}
 		for j, p := range u.PinSHA256 {
 			if !isHex64(p) {
@@ -456,6 +621,23 @@ func (c *Config) Validate() error {
 	}
 	if c.Telemetry.SampleRatio < 0 || c.Telemetry.SampleRatio > 1 {
 		errs = append(errs, fmt.Errorf("telemetry.sample_ratio %v: must be in [0,1]", c.Telemetry.SampleRatio))
+	}
+	if c.Telemetry.CostSampleThresholdUSD < 0 {
+		errs = append(errs, fmt.Errorf("telemetry.cost_sample_threshold_usd %v: must be >= 0", c.Telemetry.CostSampleThresholdUSD))
+	}
+	if c.Telemetry.SlowSampleThreshold < 0 {
+		errs = append(errs, fmt.Errorf("telemetry.slow_sample_threshold %v: must be >= 0", c.Telemetry.SlowSampleThreshold))
+	}
+	if c.Attribution.MaxCardinality < 0 {
+		errs = append(errs, fmt.Errorf("attribution.max_cardinality %d: must be >= 0", c.Attribution.MaxCardinality))
+	}
+	if c.Attribution.Header != "" {
+		if strings.EqualFold(c.Attribution.Header, "Authorization") {
+			errs = append(errs, fmt.Errorf("attribution.header must not be Authorization (it is consumed before forwarding)"))
+		}
+		if c.Auth.Enabled() && strings.EqualFold(c.Attribution.Header, c.Auth.HeaderName()) {
+			errs = append(errs, fmt.Errorf("attribution.header must differ from auth.header"))
+		}
 	}
 	if c.Telemetry.Insecure && !c.Telemetry.AcknowledgeInsecure && !isLocalEndpoint(c.Telemetry.Endpoint) {
 		errs = append(errs, fmt.Errorf(
@@ -576,11 +758,16 @@ func isHex64(s string) bool {
 // Match returns the upstream whose Prefix is the longest match of urlPath, or
 // (Upstream{}, false) if none. Longest-prefix-match keeps routing predictable
 // when prefixes nest (e.g. "/v1" and "/v1/embeddings").
+//
+// Matching is segment-aware: prefix "/v1" matches "/v1" and "/v1/chat"
+// but NOT "/v1foo". Raw byte-prefix matching routed sibling paths into
+// the wrong upstream — a parser differential between routing (which
+// saw "/v1foo" as openai) and enrichment (which is segment-strict).
 func (c *Config) Match(urlPath string) (Upstream, bool) {
 	var best Upstream
 	bestLen := -1
 	for _, u := range c.Upstreams {
-		if !strings.HasPrefix(urlPath, u.Prefix) {
+		if !prefixMatchesSegment(urlPath, u.Prefix) {
 			continue
 		}
 		if len(u.Prefix) > bestLen {
@@ -589,4 +776,14 @@ func (c *Config) Match(urlPath string) (Upstream, bool) {
 		}
 	}
 	return best, bestLen >= 0
+}
+
+// prefixMatchesSegment reports whether p falls under prefix at a path
+// segment boundary: exact match, or prefix followed by "/".
+func prefixMatchesSegment(p, prefix string) bool {
+	if prefix == "/" {
+		return strings.HasPrefix(p, "/")
+	}
+	prefix = strings.TrimSuffix(prefix, "/")
+	return p == prefix || strings.HasPrefix(p, prefix+"/")
 }

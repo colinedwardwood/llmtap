@@ -1,0 +1,17 @@
+apiVersion: v2
+name: llmtap
+description: OpenTelemetry tap for OpenAI- and Anthropic-compatible LLM APIs
+type: application
+version: 0.1.0
+appVersion: "0.1.5"
+home: https://github.com/colinedwardwood/llmtap
+sources:
+  - https://github.com/colinedwardwood/llmtap
+keywords:
+  - otel
+  - llm
+  - proxy
+  - genai
+maintainers:
+  - name: Colin Wood
+    url: https://github.com/colinedwardwood

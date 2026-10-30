@@ -1,0 +1,44 @@
+# CI smoke-test overlay. Apply on top of the base stack:
+#   docker compose -f docker-compose.yml -f docker-compose.smoke.yml up
+# or via the driver script: test/smoke/smoke.sh
+#
+# Swaps the real OpenAI upstream for a local stub (no API key needed),
+# and runs llmtap plaintext-on-:4000 like the insecure overlay — the
+# smoke test exercises the telemetry pipeline, not TLS.
+services:
+  stub:
+    build:
+      context: ../../test/smoke/stub
+
+  # The test only talks to llmtap (:4000) and the Prometheus query API
+  # (:9090) from the host. Everything else stays network-internal so
+  # the job can't collide with ports already in use on the machine.
+  otel-collector:
+    ports: !override []
+  tempo:
+    ports: !override []
+  loki:
+    ports: !override []
+  grafana:
+    ports: !override []
+
+  llmtap:
+    command: ["up", "--config", "/etc/llmtap/config.yaml"]
+    ports: !override
+      - "4000:4000"
+    environment:
+      LLMTAP_LISTEN: "0.0.0.0:4000"
+      LLMTAP_ALLOW_INSECURE: "true"
+      LLMTAP_TLS_CERT_FILE: ""
+      LLMTAP_TLS_KEY_FILE: ""
+      LLMTAP_OTLP_ENDPOINT: "otel-collector:4317"
+      LLMTAP_OTLP_PROTOCOL: "grpc"
+      LLMTAP_OTLP_INSECURE: "true"
+      LLMTAP_OTLP_ACKNOWLEDGE_INSECURE: "true"
+      LLMTAP_CAPTURE: "off"
+      LLMTAP_ENV: "smoke"
+    volumes:
+      - ../../test/smoke/llmtap.smoke.yaml:/etc/llmtap/config.yaml:ro
+    depends_on:
+      stub:
+        condition: service_started

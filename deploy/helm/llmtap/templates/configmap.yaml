@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llmtap.fullname" . }}
+  labels:
+    {{- include "llmtap.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    listen: {{ .Values.config.listen | quote }}
+    {{- if .Values.tls.enabled }}
+    tls:
+      cert_file: /etc/llmtap/tls/tls.crt
+      key_file: /etc/llmtap/tls/tls.key
+    {{- end }}
+    {{- if .Values.auth.enabled }}
+    auth:
+      tokens_file: {{ printf "%s/tokens" .Values.auth.mountPath | quote }}
+    {{- end }}
+    service:
+      name: {{ .Values.config.serviceName | quote }}
+      namespace: observability
+      environment: {{ .Values.config.environment | quote }}
+    content:
+      mode: {{ .Values.config.contentMode | quote }}
+      redact: {{ .Values.config.contentRedact | quote }}
+    request:
+      max_body_bytes: {{ .Values.config.maxBodyBytes | int }}
+    http:
+      stream_idle_timeout: {{ .Values.config.streamIdleTimeout | quote }}
+      shutdown_timeout: {{ printf "%ds" (int .Values.probes.shutdownTimeoutSeconds) | quote }}
+    telemetry:
+      endpoint: localhost:4317
+      protocol: grpc
+      insecure: true
+    upstreams:
+    {{- range .Values.config.upstreams }}
+      - name: {{ .name | quote }}
+        prefix: {{ .prefix | quote }}
+        target: {{ .target | quote }}
+        provider: {{ .provider | quote }}
+        strip_prefix: {{ .stripPrefix }}
+        max_in_flight: {{ $.Values.config.maxInFlight }}
+        breaker:
+          failures: {{ $.Values.config.breaker.failures }}
+          window: {{ $.Values.config.breaker.window }}
+          recovery_window: {{ $.Values.config.breaker.recoveryWindow }}
+    {{- end }}

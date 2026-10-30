@@ -1,6 +1,6 @@
 # llmtap
 
-> **OpenTelemetry tap for any LLM API.** Drop it between your app and OpenAI / Anthropic. Get traces, metrics, cost, and (optionally) redacted prompts in the observability stack you already run. Zero code changes.
+> **OpenTelemetry tap for OpenAI- and Anthropic-compatible LLM APIs.** Drop it between your app and the provider. Get traces, metrics, cost, and (optionally) redacted prompts in the observability stack you already run. Zero code changes.
 
 `llmtap` is a single-binary HTTP reverse proxy that speaks the OpenAI Chat Completions / Embeddings and Anthropic Messages wire formats. It forwards every request byte-for-byte, streams every response byte-for-byte, and out-of-band emits OpenTelemetry traces, metrics, and logs that follow the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/).
 
@@ -16,39 +16,76 @@ Engineering teams ship LLM features faster than they instrument them. Surprise f
 
 ---
 
-## Quick start
+## Quick start (60 seconds, local demo)
+
+The fastest path is the plaintext-loopback demo stack — no certificates to trust, everything on localhost. **Demo only; the production path below uses TLS.**
 
 ```bash
-# 1. bring up llmtap + Tempo + Prometheus + Loki + Grafana on TLS
+# 1. bring up llmtap + Tempo + Prometheus + Loki + Grafana (plaintext on :4000)
+make compose-up-insecure
+
+# 2. send a real request through the proxy
+export OPENAI_BASE_URL=http://localhost:4000/v1
+curl "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5-mini",
+    "messages": [{"role": "user", "content": "Say hello in five words."}]
+  }'
+
+# 3. open Grafana → "LLM Observability — llmtap" dashboard
+open http://localhost:3000          # anonymous admin, no login needed
+```
+
+Every SDK that lets you override the base URL works the same way — set `OPENAI_BASE_URL` (or `base_url=` in the constructor) and change nothing else. Anthropic clients point at the `/anthropic` route:
+
+```bash
+curl http://localhost:4000/anthropic/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-fable-5",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "Say hello in five words."}]
+  }'
+```
+
+Tear down with `make compose-down`.
+
+### Production path: TLS
+
+For anything beyond a localhost demo, run the TLS stack. It generates a self-signed cert on first boot (SAN covers `localhost` and `127.0.0.1`); in real deployments you'd mount certs from your PKI instead.
+
+```bash
+# 1. bring the stack up on HTTPS :4443
 make compose-up
 
-# 2. point any OpenAI-compatible client at the proxy
+# 2. copy the generated cert out of the container
+docker compose -f deploy/compose/docker-compose.yml \
+  cp llmtap:/etc/llmtap/tls/tls.crt ./llmtap-ca.crt
+
+# 3. same curl as above, now over TLS
 export OPENAI_BASE_URL=https://localhost:4443/v1
-# Trust the self-signed cert; e.g. with curl:
-curl --cacert <(docker compose -f deploy/compose/docker-compose.yml exec llmtap cat /etc/llmtap/tls/tls.crt) \
-     -H "Authorization: Bearer $OPENAI_API_KEY" \
-     "$OPENAI_BASE_URL/chat/completions" -d '{...}'
-
-# (Python SDK users: set REQUESTS_CA_BUNDLE / SSL_CERT_FILE
-# to the generated cert path, or use `verify=False` for a demo.)
-
-# 3. open Grafana
-open http://localhost:3000          # admin / admin
-#    → "LLM Observability — llmtap" dashboard
+curl --cacert ./llmtap-ca.crt "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5-mini",
+    "messages": [{"role": "user", "content": "Say hello in five words."}]
+  }'
 ```
 
-Anthropic works the same way:
+How to make each client trust the cert:
 
-```bash
-export ANTHROPIC_BASE_URL=https://localhost:4443/anthropic
-```
-
-For a plaintext-loopback demo (no TLS handshake to worry about, **not for production**):
-
-```bash
-make compose-up-insecure
-export OPENAI_BASE_URL=http://localhost:4000/v1
-```
+| Client | Trust the proxy cert with |
+|---|---|
+| curl | `--cacert ./llmtap-ca.crt` |
+| Python (`openai`, `anthropic` — both use httpx) | `export SSL_CERT_FILE=$PWD/llmtap-ca.crt` |
+| Node.js (`openai`, `@anthropic-ai/sdk`) | `export NODE_EXTRA_CA_CERTS=$PWD/llmtap-ca.crt` |
+| Go (`net/http`, official SDKs) | `export SSL_CERT_FILE=$PWD/llmtap-ca.crt` (honored by `crypto/x509` on Linux/macOS), or add to `tls.Config.RootCAs` |
+| Anything else | add `llmtap-ca.crt` to the OS trust store |
 
 ---
 
@@ -59,8 +96,8 @@ export OPENAI_BASE_URL=http://localhost:4000/v1
 ```bash
 git clone https://github.com/colinedwardwood/llmtap
 cd llmtap
-make build
-./llmtap up --config config.yaml
+make run          # builds, then starts against config.yaml
+                  # (falls back to config.example.yaml on a fresh clone)
 ```
 
 ### `go install`
@@ -119,13 +156,18 @@ Three layers, lowest precedence first: built-in defaults → `config.yaml` → `
 | OTLP endpoint | `LLMTAP_OTLP_ENDPOINT` | `localhost:4317` |
 | OTLP protocol | `LLMTAP_OTLP_PROTOCOL` | `grpc` (or `http`) |
 | OTLP insecure | `LLMTAP_OTLP_INSECURE` | `true` |
+| Acknowledge plaintext OTLP to a non-local host | `LLMTAP_OTLP_ACKNOWLEDGE_INSECURE` | `false` |
 | OTLP headers (`k=v,k=v`) | `LLMTAP_OTLP_HEADERS` | `""` |
 | OTLP sample ratio (`[0,1]`) | `LLMTAP_SAMPLE_RATIO` | `1.0` |
+| Always sample calls costing at least USD | `LLMTAP_COST_SAMPLE_THRESHOLD_USD` | `0` (off) |
+| Always sample calls slower than duration | `LLMTAP_SLOW_SAMPLE_THRESHOLD` | `0` (off) |
 | Content capture | `LLMTAP_CAPTURE` | `off` (or `events`, `logs`) |
+| Caller attribution header | `LLMTAP_ATTRIBUTION_HEADER` | `""` |
+| Redacted JSONL recording path | `LLMTAP_RECORDING_PATH` | `""` (off) |
 | Service name | `LLMTAP_SERVICE_NAME` | `llmtap` |
 | Environment | `LLMTAP_ENV` | `dev` |
 
-Structural config (upstreams, auth tokens, breaker thresholds, cert pins, redaction profile) lives in YAML — see `config.example.yaml`. Highlights:
+Structural config (upstreams, auth tokens, breaker thresholds, cert pins, redaction profile) lives in YAML — see `config.example.yaml`. For production, start from [`config.production.yaml`](config.production.yaml) (concurrency cap + breaker on, non-loopback TLS bind). Highlights:
 
 ```yaml
 upstreams:
@@ -144,8 +186,9 @@ upstreams:
 content:
   mode: events                       # off | events | logs
   redact: default                    # off | default | strict
-                                     # masks sk-*, AKIA*, xox*, JWTs,
-                                     # emails, JSON private_key (default)
+                                     # masks sk-*, AKIA*, xox*, hf_*,
+                                     # xai-*, PEM keys, JWTs, emails,
+                                     # JSON private_key, … (default)
                                      # + Luhn CCs, US SSNs, E.164 (strict)
 
 auth:
@@ -161,9 +204,68 @@ http:
   body_read_timeout: 30s             # slow-uploader DoS guard
   cert_reload_interval: 30s          # cert-manager / Let's Encrypt
                                      # renewals picked up live
+  stream_idle_timeout: 5m            # kill hung post-header bodies
+
+attribution:
+  header: X-Caller                    # else mTLS CN, then auth fingerprint
+  max_cardinality: 200                # extra callers collapse to _other
+
+recording:
+  path: ./recordings/traffic.jsonl    # payloads inherit content.redact
 ```
 
 Routing is longest-prefix-match. Reserved prefixes `/healthz` and `/readyz` cannot be configured.
+
+### Provider compatibility
+
+| Provider/API | Parser | Streaming | Tool calls | Usage detail |
+|---|---|---:|---:|---:|
+| OpenAI Chat Completions | native | yes | yes | cached/reasoning |
+| OpenAI Responses API | native | yes | function + built-in tool events | cached/reasoning |
+| Anthropic Messages | native | yes | yes | cache reads |
+| Google Gemini `generateContent` | native | yes (SSE) | yes | cached/thought tokens |
+| Azure OpenAI, Groq, OpenRouter, vLLM, Ollama OpenAI endpoint | OpenAI-compatible | yes | yes | when returned |
+
+Provider-specific extensions can differ from their compatibility target. Bedrock
+(SigV4) and Ollama's native endpoint are not parsed.
+
+For a keyless local upstream, run `llmtap demo --listen 127.0.0.1:8080`.
+`llmtap gen-cert --host localhost --out-dir ./certs` creates a local ECDSA
+certificate. Recorded traffic can be exercised with
+`llmtap replay --target http://127.0.0.1:8080 --out replay.jsonl traffic.jsonl`
+and compared using `llmtap diff traffic.jsonl replay.jsonl`.
+
+Proxy-generated faults (notably upstream `502` and body `413`) return a JSON body `{"error":{"type":"llmtap_proxy_error","code":"…","message":"…"}}` plus `X-Request-Id` (echoed from the client header when set, else generated) and `X-Trace-Id` when a span is active — so SDK users can tell llmtap from the provider and join the complaint to a span.
+
+---
+
+## Sizing
+
+llmtap is mostly I/O-bound; CPU shows up in JSON parse, redaction, and argon2 auth verifies. Ballpark budgets from the fixed buffers in tree (not a synthetic load lab):
+
+| Resource | Bound | Notes |
+|---|---|---|
+| Enrichment head | 1 MiB / request | Request body sneak-peek for span attributes |
+| Stream assemble (content on) | 64 KiB / stream | Completion text cap when `content.mode: events` |
+| Auth verify | ~64 MiB peak / argon2 | Semaphore-bounded; prefer short allow-lists |
+| `max_in_flight` | operator | Hard fan-out to one upstream |
+
+**Memory rule of thumb:** plan ~2–4 MiB RSS per concurrent enriched request (head buffer + HTTP stacks + OTel), plus stream lifetime. With `max_in_flight: 256` per upstream, size the cgroup for roughly `256 × 4 MiB × upstreams` plus a 256–512 MiB baseline, then set:
+
+```bash
+# Match the container memory limit (example: 2 GiB cgroup).
+GOMEMLIMIT=1800MiB
+```
+
+Go will GC harder as it approaches the limit; without `GOMEMLIMIT`, a rare traffic spike can grow RSS until the kubelet OOM-kills the pod mid-stream.
+
+**Concurrency:** leave `max_in_flight` unset only for local demos. In production start at `256` (as in `config.production.yaml`) and lower it if `llmtap.requests.rejected.total{reason="concurrency"}` stays near zero while upstream p99 latency climbs — the useful knob is often the *upstream's* limit, not llmtap's. Pair with the circuit breaker (`failures: 5`, `window: 30s`) so a brownout fails fast with `503` instead of pinning every slot on hung dials.
+
+**Streams:** `http.stream_idle_timeout` (default `5m`) force-closes bodies that go silent after headers; watch `llmtap.streams.idle_timeouts.total` and `llmtap.streams.active`. On SIGTERM, `/readyz` flips false immediately; size `terminationGracePeriodSeconds` to cover Endpoint drain + `shutdown_timeout` (distroless has no `sleep` for `preStop`).
+
+**Auth:** `auth.tokens` is capped at **64** PHC hashes (`auth.MaxAllowListTokens`). Each miss runs argon2 against every entry — keep the allow-list short. Failed tokens are negative-cached for 30s so brute-force replays skip argon2. Prefer `auth.tokens_file` for Secret mounts.
+
+**Throughput:** non-streaming chat on a quiet laptop typically clears **~2,000–4,000 req/s/core** through the proxy path when the upstream is a local stub (see `test/load`); real LLM backends dominate wall time. Streaming: **~100 concurrent SSE** connections with **<32 MiB** heap growth in the load harness (`TestLoadStreaming`).
 
 ---
 
@@ -177,7 +279,7 @@ Attributes (subset — full list in [`internal/genai/genai.go`](internal/genai/g
 
 | Attribute | Description |
 |---|---|
-| `gen_ai.system` | `openai`, `anthropic` |
+| `gen_ai.provider.name` | `openai`, `anthropic`, `gcp.gen_ai` |
 | `gen_ai.operation.name` | `chat`, `embeddings` |
 | `gen_ai.request.model` / `gen_ai.response.model` | catches model fallbacks |
 | `gen_ai.request.temperature` / `top_p` / `max_tokens` / `seed` / … | request shape |
@@ -202,6 +304,11 @@ Span events (when `content.mode: events`): `gen_ai.system.message`, `gen_ai.user
 | `gen_ai.client.cost.usd.total` | counter (USD) | system, request_model, response_model |
 | `llmtap.requests.total` | counter | upstream, status |
 | `llmtap.requests.in_flight` | up-down counter | upstream |
+| `llmtap.requests.rejected.total` | counter | reason, upstream |
+| `llmtap.breaker.state` | gauge | upstream (0/1/2) |
+| `llmtap.streams.active` | up-down counter | — |
+| `llmtap.streams.idle_timeouts.total` | counter | upstream |
+| `llmtap.telemetry.export_errors.total` | counter | — |
 
 Model labels are normalized (date suffixes stripped, lowercase) and bounded by a per-process cardinality cap (default 200; overflow → `_other`) so a misbehaving client can't blow up your Prometheus.
 
@@ -209,10 +316,15 @@ The proxy itself is wrapped in [`otelhttp`](https://pkg.go.dev/go.opentelemetry.
 
 ### Example PromQL
 
+Prometheus's OTLP receiver translates dots to underscores and appends
+unit/type suffixes (`.duration` + unit `s` → `_duration_seconds`;
+histograms grow `_bucket`/`_sum`/`_count`). The queries below are
+written against the translated names, matching the shipped dashboard.
+
 ```promql
 # Cost per hour, by model (counter)
 sum by (gen_ai_request_model) (
-  rate(gen_ai_client_cost_usd_total_total[5m])
+  rate(gen_ai_client_cost_usd_total[5m])
 ) * 3600
 
 # p95 cost per call, by model (histogram)
@@ -226,10 +338,10 @@ histogram_quantile(0.95, sum by (le, gen_ai_request_model) (
 ))
 
 # Tokens / second, in vs out
-sum by (token_type) (rate(gen_ai_client_token_usage_token_sum[5m]))
+sum by (token_type) (rate(gen_ai_client_token_usage_sum[5m]))
 ```
 
-A starter dashboard ships in [`deploy/grafana/dashboards/llmtap-overview.json`](deploy/grafana/dashboards/llmtap-overview.json).
+A starter dashboard ships in [`deploy/grafana/dashboards/llmtap-overview.json`](deploy/grafana/dashboards/llmtap-overview.json) (v2: error-rate + self-health row). Alert expressions: [`deploy/grafana/alerts/llmtap-alerts.yaml`](deploy/grafana/alerts/llmtap-alerts.yaml).
 
 ---
 
@@ -260,6 +372,22 @@ A starter dashboard ships in [`deploy/grafana/dashboards/llmtap-overview.json`](
 - **Concurrency-safe.** One `*httputil.ReverseProxy` per upstream, shared across requests; per-request state travels through `context`.
 - **Graceful shutdown.** `signal.NotifyContext` → drain active SSE streams (`Handler.WaitForStreams`) → `Server.Shutdown` → telemetry flush.
 - **Hot cert reload.** The cert manager re-stats `tls.cert_file` / `tls.key_file` on a ticker (`http.cert_reload_interval`, default 30s) and atomically swaps the served cert when ModTime advances. No listener drop, no process restart.
+
+---
+
+## Kubernetes
+
+Helm chart: [`deploy/helm/llmtap`](deploy/helm/llmtap). Stand-alone
+cert-manager Certificate, NetworkPolicy, and per-replica breaker/cap
+semantics: [`deploy/k8s/README.md`](deploy/k8s/README.md).
+
+```bash
+helm upgrade --install llmtap ./deploy/helm/llmtap
+```
+
+Auth hashes for the chart belong in a Secret mounted via `auth.tokens_file`
+(not the ConfigMap). Container liveness uses `/healthz`; readiness uses
+`/readyz` (true readiness after first OTLP export; false on SIGTERM).
 
 ---
 
@@ -295,15 +423,31 @@ LLMTAP_LISTEN=0.0.0.0:4443 \
 
 `content.mode: events` attaches content as span events. **`content.redact`** controls how that content is scrubbed before it reaches the wire; default is `default`:
 
+`content.mode: logs` emits the same redacted content via the **OTel log signal** instead of span events — route logs to a separate retention tier at the collector (`content.redact` applies identically).
+
 | Profile | What it masks |
 |---|---|
 | `off` | nothing — opt-in only, raw content ships |
-| `default` (recommended) | OpenAI `sk-…` tokens, Slack `xox{abprs}-…`, AWS `AKIA…` access keys, GCP service-account `private_key` field, common JWT shape, RFC-5322 emails |
+| `default` (recommended) | OpenAI `sk-…` tokens, Slack `xox{abprs}-…`, AWS `AKIA…` access keys, Google `AIza…` keys, Groq `gsk_…`, Replicate `r8_…`, Hugging Face `hf_…`, xAI `xai-…`, GitHub `ghp_…` / `github_pat_…`, GCP service-account `private_key` field, raw PEM private-key blocks, common JWT shape, RFC-5322 emails |
 | `strict` | `default` plus credit-card numbers (Luhn-validated, no false positives on prose digits), US SSNs, E.164 phone numbers |
 
 The default profile is engaged automatically when content capture is turned on; flipping `mode: events` without thinking about redaction will NOT silently ship raw secrets. Operators who want raw content must explicitly set `content.redact: off`.
 
-`content.mode: logs` routes the same content through the OTel log signal so retention can be scoped separately at the collector.
+Redaction is pattern-based and best-effort: it catches well-known credential shapes, not arbitrary secrets, so treat your tracing backend as sensitive whenever content capture is on.
+
+### Compliance & data processing
+
+llmtap is infrastructure software, not a SaaS. **You** are the data controller when `content.mode` is `events` or `logs` — prompts and completions may contain PII and are exported to **your** OTLP backend. By default llmtap does not persist content at rest. Setting `recording.path` explicitly enables local JSONL persistence; request, response, and URL values pass through `content.redact`, files are created mode `0600`, and the operator owns retention and encryption. OTLP retention, residency, encryption, and access control are determined by your collector and observability vendor.
+
+| Topic | Posture |
+|---|---|
+| GDPR / lawful basis | Metadata-only mode (`off`) minimizes personal data. Content capture requires your own legal basis and DPA with the OTLP destination. |
+| Retention | Configure at the collector (e.g. shorter log pipeline TTL than traces when using `mode: logs`). |
+| Residency | llmtap forwards OTLP to the endpoint you configure; no cloud hop unless you point it at one. |
+| Redaction ≠ anonymization | Masked secrets can still leave semantic content in spans/logs. |
+| Subprocessors | Upstream LLM providers (OpenAI, Anthropic, …) receive the original request body regardless of capture mode. |
+
+Release artifacts ship `NOTICE` (third-party licenses) and SPDX SBOMs from the release workflow.
 
 **Body forwarding.** llmtap forwards request bodies byte-for-byte to the upstream (`request.max_body_bytes` ceiling, default 32 MiB; above it the proxy returns 413 without contacting the upstream). It strips the `Accept-Encoding` header from the outbound request so Go's `http.Transport` can transparently decompress gzip responses, and adds a `Via: llmtap` marker so audit logs can see it in the chain. It does **not** strip auth headers. The auth header llmtap consumes (`auth.header`, default `X-LLMTAP-Token`) IS stripped before forwarding so the listener-side secret never reaches the upstream.
 
@@ -312,8 +456,9 @@ The default profile is engaged automatically when content capture is turned on; 
 ## Operability
 
 - `/healthz` returns 200 once `Run` has accepted on the listener — k8s / ALB / Cloudflare Tunnel liveness target.
-- `/readyz` returns 200 once telemetry exporters are up, 503 + `Retry-After: 1` otherwise.
+- `/readyz` returns 200 only after the first successful OTLP export round-trip, and flips to 503 as soon as SIGTERM is received (before stream drain). Until the first export succeeds it stays 503 + `Retry-After: 1`.
 - Both endpoints short-circuit BEFORE the auth gate so probes work without credentials.
+- Kubernetes: point `livenessProbe` at `/healthz` and `readinessProbe` at `/readyz`. On rolling update, SIGTERM makes `/readyz` fail immediately — give the LB a moment with `terminationGracePeriodSeconds` (≥ shutdown timeout) and optionally a short `preStop` sleep so in-flight requests finish after the endpoint is marked NotReady.
 - The proxy logs at `--log-level=info` by default; `debug` / `warn` / `error` change verbosity for both the stderr text handler and the OTLP log bridge.
 
 ---
@@ -341,19 +486,17 @@ make build    # ./llmtap
 make release  # cross-compile linux/{amd64,arm64} + darwin/arm64
 ```
 
-CI runs on every PR + push to `main` (`.github/workflows/ci.yml`): test (`-race -count=1 -timeout=2m -covermode=atomic` with a 60% line-coverage gate on `internal/`), `golangci-lint v2`, `govulncheck`, `trivy fs --severity HIGH,CRITICAL`, and a three-target build matrix.
+CI runs on every PR + push to `main` (`.github/workflows/ci.yml`): test (`-race -count=1 -timeout=2m -covermode=atomic` with a 70% line-coverage gate and per-package floors), fuzz smoke tests, `golangci-lint v2`, `govulncheck`, `trivy fs --severity HIGH,CRITICAL`, and a three-target build matrix.
 
 Tags `v*` trigger the release pipeline (`.github/workflows/release.yml`): cross-compiled binaries → aggregate SHA-256 → SLSA-3 provenance → CycloneDX SBOMs (syft) → cosign keyless sign each binary → multi-arch docker buildx push to `ghcr.io` (with provenance + SBOM attestations) → cosign sign the image digest → GitHub release with every artifact.
 
 ---
 
-## Roadmap (v0.2+)
+## Roadmap (v0.4+)
 
-- Bedrock, Gemini, Ollama-native parsers.
-- `llmtap record` + `llmtap replay` + `llmtap diff` for migration A/B.
-- Sampling strategies tied to GenAI signals (cost-weighted, error-biased).
-- Stricter readiness signal (wait for first successful OTLP export round-trip).
-- Per-upstream rate-limit (request-per-second + token-per-second), in addition to the existing concurrency cap.
+- Bedrock (SigV4-aware) and Ollama-native parsers.
+- Collector recipes for whole-trace tail sampling.
+- Optional replay header templates and richer semantic response diffing.
 
 ---
 

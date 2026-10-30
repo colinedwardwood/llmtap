@@ -9,11 +9,12 @@
 #
 # Quick start (from repo root):
 #   make compose-up
-#   # Trust the self-signed cert OR use curl -k. With the OpenAI Python SDK,
-#   # set OPENAI_BASE_URL=https://localhost:4443/v1 and either install the
-#   # cert in the trust store or set REQUESTS_CA_BUNDLE / SSL_CERT_FILE to
-#   # ./deploy/compose/data/tls/tls.crt.
-#   open http://localhost:3000   # admin / admin
+#   docker compose -f deploy/compose/docker-compose.yml \
+#     cp llmtap:/etc/llmtap/tls/tls.crt ./llmtap-ca.crt
+#   # then point clients at https://localhost:4443 and trust the cert:
+#   # curl --cacert, Python SSL_CERT_FILE, Node NODE_EXTRA_CA_CERTS —
+#   # see the README "Production path: TLS" trust matrix.
+#   open http://localhost:3000   # anonymous admin
 #
 # If you really want plaintext loopback for a 30-second demo, use
 # `make compose-up-insecure` instead — see the override file.
@@ -54,11 +55,12 @@ services:
       LLMTAP_TLS_KEY_FILE: "/etc/llmtap/tls/tls.key"
       LLMTAP_OTLP_ENDPOINT: "otel-collector:4317"
       LLMTAP_OTLP_PROTOCOL: "grpc"
-      # otel-collector is on the docker network, not WAN — plaintext OTLP
-      # is fine here and the new A9 validator accepts the loopback/RFC1918
-      # range. The flag below is only required if the operator points
-      # LLMTAP_OTLP_ENDPOINT at something off-network.
+      # otel-collector is on the docker network, not WAN — plaintext
+      # OTLP is fine here. Validation can't tell that a docker-network
+      # alias is private (hostnames are conservatively non-local), so
+      # the acknowledge flag opts in explicitly.
       LLMTAP_OTLP_INSECURE: "true"
+      LLMTAP_OTLP_ACKNOWLEDGE_INSECURE: "true"
       LLMTAP_CAPTURE: "off"
       LLMTAP_ENV: "demo"
     volumes:

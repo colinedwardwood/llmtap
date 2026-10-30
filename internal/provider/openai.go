@@ -1,9 +1,10 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"io"
-	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,72 +49,13 @@ func (OpenAI) OperationFor(urlPath string) string {
 			return genai.OpEmbeddings
 		}
 	}
-	return ""
-}
-
-// pathSegments returns the cleaned, non-empty `/`-separated segments of
-// urlPath. A trailing slash returns nil — operation endpoints are exact
-// resources, not directories, so `/v1/chat/completions/` is rejected.
-// An empty urlPath returns a nil slice.
-func pathSegments(urlPath string) []string {
-	if urlPath == "" || urlPath == "/" {
-		return nil
-	}
-	// Trailing slash means "this is a directory/collection", not the
-	// operation itself. Reject up front rather than let path.Clean
-	// silently rewrite it away.
-	if strings.HasSuffix(urlPath, "/") {
-		return nil
-	}
-	cleaned := path.Clean(urlPath)
-	if cleaned == "/" || cleaned == "." {
-		return nil
-	}
-	cleaned = strings.TrimPrefix(cleaned, "/")
-	if cleaned == "" {
-		return nil
-	}
-	return strings.Split(cleaned, "/")
-}
-
-// isAPIParent reports whether the segments immediately preceding an
-// operation segment look like a real API namespace boundary. The
-// segment immediately before the operation must be either a version
-// segment (`v\d+`, case-insensitive) or, for the Azure OpenAI deployment
-// shape, follow a `deployments/{name}` pair. Any other parent (e.g.
-// `files`, `.well-known`) is treated as a sub-resource collision and
-// the operation is rejected.
-func isAPIParent(parents []string) bool {
-	if len(parents) == 0 {
-		return false
-	}
-	last := parents[len(parents)-1]
-	if isVersionSegment(last) {
-		return true
-	}
-	// Azure shape: .../deployments/{anything}/<op>
-	if len(parents) >= 2 && parents[len(parents)-2] == "deployments" {
-		return true
-	}
-	return false
-}
-
-// isVersionSegment reports whether s looks like `vN` for some
-// positive-integer N (case-insensitive). Matches `v1`, `V2`, `v10`;
-// rejects `version`, `v`, `v1beta`, `1`.
-func isVersionSegment(s string) bool {
-	if len(s) < 2 {
-		return false
-	}
-	if s[0] != 'v' && s[0] != 'V' {
-		return false
-	}
-	for i := 1; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
+	// Responses API: /v1/responses and Azure-compatible deployments.
+	if n := len(segs); n >= 2 && segs[n-1] == "responses" {
+		if isAPIParent(segs[:n-1]) {
+			return genai.OpResponses
 		}
 	}
-	return true
+	return ""
 }
 
 type openAIRequest struct {
@@ -124,12 +66,15 @@ type openAIRequest struct {
 	TopP             *float64        `json:"top_p,omitempty"`
 	MaxTokens        *int64          `json:"max_tokens,omitempty"`
 	MaxComplTokens   *int64          `json:"max_completion_tokens,omitempty"`
+	MaxOutputTokens  *int64          `json:"max_output_tokens,omitempty"`
 	FrequencyPenalty *float64        `json:"frequency_penalty,omitempty"`
 	PresencePenalty  *float64        `json:"presence_penalty,omitempty"`
 	Seed             *int64          `json:"seed,omitempty"`
 	Stop             json.RawMessage `json:"stop,omitempty"`
 	Stream           bool            `json:"stream,omitempty"`
 	EncodingFormat   string          `json:"encoding_format,omitempty"`
+	Instructions     string          `json:"instructions,omitempty"`
+	ServiceTier      string          `json:"service_tier,omitempty"`
 }
 
 type openAIMessage struct {
@@ -140,66 +85,150 @@ type openAIMessage struct {
 	// the proxy doesn't need to model the per-chunk argument fragment
 	// schema; presence is all the streaming TTFT path needs.
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	Refusal   string          `json:"refusal,omitempty"`
 }
 
-func (OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
-	op := (OpenAI{}).OperationFor(urlPath)
+// decodedOpenAIRequest is the pure-decode result: Info + messages for
+// optional content emission. Span-free so record/replay can capture it.
+type decodedOpenAIRequest struct {
+	Info     Info
+	Messages []openAIMessage
+	OK       bool // false when JSON unmarshal failed
+}
+
+// DecodeRequest parses a Chat Completions / Embeddings body without
+// touching a span. Pure decode half of ParseRequest.
+func (o OpenAI) DecodeRequest(urlPath string, body []byte) decodedOpenAIRequest {
 	info := Info{
 		System:    genai.SystemOpenAI,
-		Operation: op,
+		Operation: o.OperationFor(urlPath),
 		Started:   time.Now(),
+	}
+	switch {
+	case isOpenAIResponsesPath(urlPath):
+		info.API = APIResponses
+	case info.Operation == genai.OpEmbeddings:
+		info.API = APIEmbeddings
+	default:
+		info.API = APIChatCompletions
 	}
 	var req openAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		span.SetAttributes(attribute.String(genai.AttrSystem, info.System))
-		return info
+		return decodedOpenAIRequest{Info: info, OK: false}
 	}
-
 	info.RequestModel = req.Model
 	info.Stream = req.Stream
-
-	attrs := []attribute.KeyValue{
-		attribute.String(genai.AttrSystem, info.System),
-		attribute.String(genai.AttrOperationName, info.Operation),
-		attribute.Bool(genai.AttrStream, req.Stream),
-	}
-	if req.Model != "" {
-		attrs = append(attrs, attribute.String(genai.AttrRequestModel, req.Model))
-	}
-	if req.Temperature != nil {
-		attrs = append(attrs, attribute.Float64(genai.AttrRequestTemperature, *req.Temperature))
-	}
-	if req.TopP != nil {
-		attrs = append(attrs, attribute.Float64(genai.AttrRequestTopP, *req.TopP))
+	info.ServiceTier = req.ServiceTier
+	info.Params = RequestParams{
+		Temperature:      req.Temperature,
+		TopP:             req.TopP,
+		FrequencyPenalty: req.FrequencyPenalty,
+		PresencePenalty:  req.PresencePenalty,
+		Seed:             req.Seed,
+		StopSequences:    decodeStopSequences(req.Stop),
 	}
 	switch {
+	case req.MaxOutputTokens != nil:
+		info.Params.MaxTokens = req.MaxOutputTokens
 	case req.MaxComplTokens != nil:
-		attrs = append(attrs, attribute.Int64(genai.AttrRequestMaxTokens, *req.MaxComplTokens))
+		info.Params.MaxTokens = req.MaxComplTokens
 	case req.MaxTokens != nil:
-		attrs = append(attrs, attribute.Int64(genai.AttrRequestMaxTokens, *req.MaxTokens))
+		info.Params.MaxTokens = req.MaxTokens
 	}
-	if req.FrequencyPenalty != nil {
-		attrs = append(attrs, attribute.Float64(genai.AttrRequestFrequencyPen, *req.FrequencyPenalty))
+	if req.EncodingFormat != "" && info.Operation == genai.OpEmbeddings {
+		info.Params.EncodingFormats = []string{req.EncodingFormat}
 	}
-	if req.PresencePenalty != nil {
-		attrs = append(attrs, attribute.Float64(genai.AttrRequestPresencePen, *req.PresencePenalty))
+	messages := req.Messages
+	if info.API == APIResponses {
+		messages = decodeResponsesInput(req.Input)
+		if req.Instructions != "" {
+			messages = append([]openAIMessage{{
+				Role: "system", Content: json.RawMessage(strconv.Quote(req.Instructions)),
+			}}, messages...)
+		}
 	}
-	if req.Seed != nil {
-		attrs = append(attrs, attribute.Int64(genai.AttrRequestSeed, *req.Seed))
-	}
-	if stops := decodeStopSequences(req.Stop); len(stops) > 0 {
-		attrs = append(attrs, attribute.StringSlice(genai.AttrRequestStopSequences, stops))
-	}
-	if req.EncodingFormat != "" && op == genai.OpEmbeddings {
-		attrs = append(attrs, attribute.StringSlice(genai.AttrRequestEncodingFmts, []string{req.EncodingFormat}))
-	}
-	span.SetAttributes(attrs...)
-	span.SetName(genai.SpanName(op, info.RequestModel))
+	return decodedOpenAIRequest{Info: info, Messages: messages, OK: true}
+}
 
-	if content.Capture && op == genai.OpChat {
-		emitOpenAIRequestEvents(span, req.Messages, content)
+func (o OpenAI) ParseRequest(span trace.Span, urlPath string, body []byte, content ContentOpts) Info {
+	dec := o.DecodeRequest(urlPath, body)
+	if !dec.OK {
+		span.SetAttributes(attribute.String(genai.AttrSystem, dec.Info.System))
+		return dec.Info
 	}
-	return info
+	emitRequestAttrs(span, &dec.Info)
+	if content.Capture() && dec.Info.Operation == genai.OpChat {
+		ctx := trace.ContextWithSpan(context.Background(), span)
+		emitOpenAIRequestEvents(ctx, span, dec.Messages, content)
+	}
+	return dec.Info
+}
+
+func isOpenAIResponsesPath(urlPath string) bool {
+	segs := pathSegments(urlPath)
+	if len(segs) < 2 || segs[len(segs)-1] != "responses" {
+		return false
+	}
+	return isAPIParent(segs[:len(segs)-1])
+}
+
+func decodeResponsesInput(raw json.RawMessage) []openAIMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		content, _ := json.Marshal(text)
+		return []openAIMessage{{Role: "user", Content: content}}
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) == nil {
+		messages := make([]openAIMessage, 0, len(items))
+		for _, item := range items {
+			var typed struct {
+				Type    string          `json:"type"`
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			}
+			if json.Unmarshal(item, &typed) != nil ||
+				(typed.Type != "" && typed.Type != "message") {
+				continue
+			}
+			text := decodeOpenAIContent(typed.Content, "input_text", "text")
+			if text == "" {
+				continue
+			}
+			encoded, _ := json.Marshal(text)
+			messages = append(messages, openAIMessage{Role: typed.Role, Content: encoded})
+		}
+		return messages
+	}
+	return nil
+}
+
+func decodeOpenAIContent(raw json.RawMessage, acceptedTypes ...string) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	allowed := make(map[string]struct{}, len(acceptedTypes))
+	for _, typ := range acceptedTypes {
+		allowed[typ] = struct{}{}
+	}
+	var out strings.Builder
+	for _, part := range parts {
+		if _, ok := allowed[part.Type]; ok {
+			out.WriteString(part.Text)
+		}
+	}
+	return out.String()
 }
 
 // hasToolCalls reports whether a streaming delta's `tool_calls` field
@@ -235,7 +264,7 @@ func decodeStopSequences(raw json.RawMessage) []string {
 	return nil
 }
 
-func emitOpenAIRequestEvents(span trace.Span, msgs []openAIMessage, content ContentOpts) {
+func emitOpenAIRequestEvents(ctx context.Context, span trace.Span, msgs []openAIMessage, content ContentOpts) {
 	for _, m := range msgs {
 		eventName := genai.EventUserMessage
 		switch m.Role {
@@ -246,19 +275,24 @@ func emitOpenAIRequestEvents(span trace.Span, msgs []openAIMessage, content Cont
 		case "tool":
 			eventName = genai.EventToolMessage
 		}
-		span.AddEvent(eventName, trace.WithAttributes(
-			attribute.String("role", m.Role),
-			attribute.String("content", content.Clean(string(m.Content))),
-		))
+		content.emitRoleMessage(ctx, span, eventName, m.Role,
+			decodeOpenAIContent(m.Content, "text", "input_text", "output_text"))
 	}
 }
 
 type openAIResponse struct {
-	ID      string         `json:"id"`
-	Model   string         `json:"model"`
-	Choices []openAIChoice `json:"choices"`
-	Usage   openAIUsage    `json:"usage"`
-	Data    []openAIEmbed  `json:"data"` // embeddings only
+	ID                string                 `json:"id"`
+	Model             string                 `json:"model"`
+	Choices           []openAIChoice         `json:"choices"`
+	Usage             openAIUsage            `json:"usage"`
+	Data              []openAIEmbed          `json:"data"` // embeddings only
+	Status            string                 `json:"status"`
+	ServiceTier       string                 `json:"service_tier"`
+	Output            []openAIResponseOutput `json:"output"`
+	Error             *openAIResponseError   `json:"error"`
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
 }
 
 type openAIChoice struct {
@@ -269,21 +303,49 @@ type openAIChoice struct {
 }
 
 type openAIUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
-	InputTokens      int64 `json:"input_tokens"`  // Responses API alias
-	OutputTokens     int64 `json:"output_tokens"` // Responses API alias
+	PromptTokens       int64 `json:"prompt_tokens"`
+	CompletionTokens   int64 `json:"completion_tokens"`
+	TotalTokens        int64 `json:"total_tokens"`
+	InputTokens        int64 `json:"input_tokens"`  // Responses API alias
+	OutputTokens       int64 `json:"output_tokens"` // Responses API alias
+	InputTokensDetails struct {
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+	} `json:"input_tokens_details"`
+	OutputTokensDetails struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+type openAIResponseOutput struct {
+	Type      string                  `json:"type"`
+	Role      string                  `json:"role"`
+	Name      string                  `json:"name"`
+	Arguments string                  `json:"arguments"`
+	Content   []openAIResponseContent `json:"content"`
+}
+
+type openAIResponseContent struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
+}
+
+type openAIResponseError struct {
+	Type string `json:"type"`
+	Code string `json:"code"`
 }
 
 type openAIEmbed struct {
 	Index int `json:"index"`
 }
 
-func (OpenAI) ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts) {
+// DecodeResponseJSON merges response fields into info from a complete
+// non-streaming JSON body. Returns the choices for optional content emit.
+func DecodeOpenAIResponseJSON(info *Info, body []byte) (choices []openAIChoice, ok bool) {
 	var resp openAIResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return
+		return nil, false
 	}
 	mergeOpenAIUsage(info, resp.Usage)
 	if resp.Model != "" {
@@ -292,21 +354,48 @@ func (OpenAI) ParseResponseJSON(span trace.Span, info *Info, body []byte, conten
 	if resp.ID != "" {
 		info.ResponseID = resp.ID
 	}
+	info.ServiceTier = resp.ServiceTier
+	if resp.Error != nil {
+		info.ErrorType = resp.Error.Code
+		if info.ErrorType == "" {
+			info.ErrorType = resp.Error.Type
+		}
+	}
+	if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != "" {
+		info.FinishReasons = append(info.FinishReasons, resp.IncompleteDetails.Reason)
+	}
+	for _, output := range resp.Output {
+		for _, part := range output.Content {
+			if part.Refusal != "" && info.Refusal == "" {
+				info.Refusal = "true"
+			}
+		}
+	}
 	for _, c := range resp.Choices {
 		if c.FinishReason != "" {
 			info.FinishReasons = append(info.FinishReasons, c.FinishReason)
 		}
+		if c.Message.Refusal != "" || c.Delta.Refusal != "" {
+			info.Refusal = "true"
+		}
 	}
+	if len(resp.Output) > 0 {
+		choices = append(choices, responsesOutputChoices(resp.Output)...)
+	}
+	return choices, true
+}
 
-	span.SetAttributes(responseAttrs(info)...)
-
-	if content.Capture && info.Operation == genai.OpChat {
-		for _, c := range resp.Choices {
-			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.Int("index", c.Index),
-				attribute.String("finish_reason", c.FinishReason),
-				attribute.String("message", content.Clean(string(c.Message.Content))),
-			))
+func (OpenAI) ParseResponseJSON(span trace.Span, info *Info, body []byte, content ContentOpts) {
+	choices, ok := DecodeOpenAIResponseJSON(info, body)
+	if !ok {
+		return
+	}
+	emitResponseAttrs(span, info)
+	if content.Capture() && info.Operation == genai.OpChat {
+		ctx := trace.ContextWithSpan(context.Background(), span)
+		for _, c := range choices {
+			content.emitChoice(ctx, span, c.Index, c.FinishReason,
+				decodeOpenAIContent(c.Message.Content, "text", "output_text"))
 		}
 	}
 }
@@ -322,26 +411,37 @@ func mergeOpenAIUsage(info *Info, u openAIUsage) {
 	} else if u.OutputTokens > 0 {
 		info.OutputTokens = u.OutputTokens
 	}
+	info.CacheReadInputTokens = u.InputTokensDetails.CachedTokens
+	info.CacheCreationInputTokens = u.InputTokensDetails.CacheWriteTokens
+	info.ReasoningOutputTokens = u.OutputTokensDetails.ReasoningTokens
 }
 
-func responseAttrs(info *Info) []attribute.KeyValue {
-	out := []attribute.KeyValue{}
-	if info.ResponseModel != "" {
-		out = append(out, attribute.String(genai.AttrResponseModel, info.ResponseModel))
+func responsesOutputChoices(output []openAIResponseOutput) []openAIChoice {
+	choices := make([]openAIChoice, 0, len(output))
+	for i, item := range output {
+		if item.Type != "message" {
+			continue
+		}
+		var text strings.Builder
+		var refusal strings.Builder
+		for _, part := range item.Content {
+			if part.Type == "output_text" || part.Type == "text" {
+				text.WriteString(part.Text)
+			}
+			if part.Type == "refusal" {
+				refusal.WriteString(part.Refusal)
+			}
+		}
+		message := text.String()
+		if message == "" {
+			message = refusal.String()
+		}
+		raw, _ := json.Marshal(message)
+		choices = append(choices, openAIChoice{Index: i, Message: openAIMessage{
+			Role: item.Role, Content: raw,
+		}})
 	}
-	if info.ResponseID != "" {
-		out = append(out, attribute.String(genai.AttrResponseID, info.ResponseID))
-	}
-	if len(info.FinishReasons) > 0 {
-		out = append(out, attribute.StringSlice(genai.AttrResponseFinishReasons, info.FinishReasons))
-	}
-	if info.InputTokens > 0 {
-		out = append(out, attribute.Int64(genai.AttrUsageInputTokens, info.InputTokens))
-	}
-	if info.OutputTokens > 0 {
-		out = append(out, attribute.Int64(genai.AttrUsageOutputTokens, info.OutputTokens))
-	}
-	return out
+	return choices
 }
 
 // streaming chunk: roughly the same shape as openAIResponse but `choices[].delta`
@@ -352,19 +452,53 @@ func (OpenAI) WrapStream(
 	info *Info,
 	body io.ReadCloser,
 	content ContentOpts,
-	onFirstToken func(),
 	onDone func(),
 ) io.ReadCloser {
-	var (
-		assembled strings.Builder
-		gotFirst  bool
-	)
-
-	onEvent := func(_ string, data []byte) {
-		if len(data) == 0 {
+	c := newStreamCollector(span, info, content, onDone)
+	return c.wrap(body, func(event string, data []byte) {
+		if len(data) == 0 || string(data) == "[DONE]" {
 			return
 		}
-		if string(data) == "[DONE]" {
+		if info.API == APIResponses {
+			var evt struct {
+				Type     string         `json:"type"`
+				Delta    string         `json:"delta"`
+				Code     string         `json:"code"`
+				Response openAIResponse `json:"response"`
+			}
+			if json.Unmarshal(data, &evt) != nil {
+				return
+			}
+			kind := evt.Type
+			if kind == "" {
+				kind = event
+			}
+			switch kind {
+			case "response.output_text.delta":
+				if evt.Delta != "" {
+					c.noteFirstToken()
+					c.appendText(evt.Delta)
+				}
+			case "response.refusal.delta":
+				if evt.Delta != "" {
+					info.Refusal = "true"
+					c.noteFirstToken()
+					c.appendText(evt.Delta)
+				}
+			case "response.completed", "response.failed", "response.incomplete":
+				mergeResponsesEvent(info, evt.Response)
+			case "error":
+				info.ErrorType = evt.Code
+			}
+			if responsesGeneratedDelta(kind) && evt.Delta != "" {
+				c.noteFirstToken()
+			}
+			if responsesToolEvent(kind) {
+				if span.IsRecording() {
+					span.AddEvent(genai.EventToolCall,
+						trace.WithAttributes(attribute.String("type", kind)))
+				}
+			}
 			return
 		}
 		var chunk openAIResponse
@@ -378,51 +512,73 @@ func (OpenAI) WrapStream(
 			info.ResponseID = chunk.ID
 		}
 		mergeOpenAIUsage(info, chunk.Usage)
-		for _, c := range chunk.Choices {
-			if c.FinishReason != "" {
-				info.FinishReasons = append(info.FinishReasons, c.FinishReason)
+		for _, ch := range chunk.Choices {
+			if ch.FinishReason != "" {
+				info.FinishReasons = append(info.FinishReasons, ch.FinishReason)
 			}
-			delta := string(c.Delta.Content)
+			delta := string(ch.Delta.Content)
 			// A tool-only stream populates delta.tool_calls and leaves
 			// delta.content empty. Both shapes count as a "first token"
 			// for TTFT — without this, tool-using calls record
 			// FirstTokenAt=0 and skew every operator's TTFT histogram.
-			if delta != "" || hasToolCalls(c.Delta.ToolCalls) {
-				if !gotFirst {
-					gotFirst = true
-					info.FirstTokenAt = time.Now()
-					onFirstToken()
-				}
+			if delta != "" || hasToolCalls(ch.Delta.ToolCalls) {
+				c.noteFirstToken()
 				// Only text content is assembled — tool-call arguments
 				// stream as opaque JSON fragments and aren't meaningful
 				// as concatenated text on the trace.
-				if content.Capture && delta != "" {
-					assembled.WriteString(delta)
-				}
+				c.appendText(delta)
 			}
 		}
-	}
+	})
+}
 
-	var tee *sseTee
-	closer := func() {
-		if !info.Finished.IsZero() {
-			return
-		}
-		info.Finished = time.Now()
-		span.SetAttributes(responseAttrs(info)...)
-		if content.Capture && assembled.Len() > 0 {
-			span.AddEvent(genai.EventChoice, trace.WithAttributes(
-				attribute.String("message", content.Clean(assembled.String())),
-			))
-		}
-		if n := tee.Overflows(); n > 0 {
-			span.SetAttributes(attribute.Int("llmtap.sse_parser_overflows", n))
-		}
-		onDone()
+func responsesToolEvent(kind string) bool {
+	if strings.HasPrefix(kind, "response.function_call_arguments.") ||
+		strings.HasPrefix(kind, "response.custom_tool_call_input.") ||
+		strings.HasPrefix(kind, "response.mcp_call_arguments.") ||
+		strings.HasPrefix(kind, "response.code_interpreter_call_code.") {
+		return true
 	}
+	for _, marker := range []string{
+		".web_search_call.", ".file_search_call.", ".code_interpreter_call.",
+		".computer_call.", ".mcp_call.", ".image_generation_call.",
+	} {
+		if strings.Contains(kind, marker) {
+			return true
+		}
+	}
+	return false
+}
 
-	tee = newSSETee(body, onEvent, nil, closer)
-	return tee
+func responsesGeneratedDelta(kind string) bool {
+	switch kind {
+	case "response.output_text.delta", "response.refusal.delta",
+		"response.reasoning_text.delta", "response.reasoning_summary_text.delta",
+		"response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+		"response.mcp_call_arguments.delta", "response.code_interpreter_call_code.delta":
+		return true
+	}
+	return false
+}
+
+func mergeResponsesEvent(info *Info, resp openAIResponse) {
+	if resp.ID != "" {
+		info.ResponseID = resp.ID
+	}
+	if resp.Model != "" {
+		info.ResponseModel = resp.Model
+	}
+	mergeOpenAIUsage(info, resp.Usage)
+	info.ServiceTier = resp.ServiceTier
+	if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != "" {
+		info.FinishReasons = append(info.FinishReasons, resp.IncompleteDetails.Reason)
+	}
+	if resp.Error != nil {
+		info.ErrorType = resp.Error.Code
+		if info.ErrorType == "" {
+			info.ErrorType = resp.Error.Type
+		}
+	}
 }
 
 var _ Provider = (*OpenAI)(nil)
